@@ -1,0 +1,4 @@
+LICENSE text eol=lf
+*.md text eol=lf
+SHA256SUMS.txt text eol=lf
+BUILD-INFO.txt text eol=lf

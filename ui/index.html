@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>按平 · 白瓷清理（can-i-delete）</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="stage" id="stage">
+  <div class="win" id="win">
+    <div class="titlebar">
+      <div class="tb-left">
+        <span class="appname">按平</span>
+        <span class="tag">缓存清理</span>
+        <span class="tag admin-tag" id="adminBadge" hidden>管理员模式</span>
+      </div>
+      <div class="tb-right">
+        <button class="ibtn" id="soundBtn" type="button" aria-label="提示音（默认关闭）" title="提示音">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 6h2.5L9 3.2v9.6L5.5 10H3z"/>
+            <path class="w" d="M11.2 6.2a2.6 2.6 0 0 1 0 3.6" opacity="0"/>
+            <path class="m" d="M11.5 6.3l3 3.4M14.5 6.3l-3 3.4"/>
+          </svg>
+        </button>
+        <button class="wbtn" id="wMin" type="button" aria-label="最小化">
+          <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><line x1="0" y1="5" x2="10" y2="5"/></svg>
+        </button>
+        <button class="wbtn" id="wMax" type="button" aria-label="最大化">
+          <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" fill="none"><rect x=".5" y=".5" width="9" height="9"/></svg>
+        </button>
+        <button class="wbtn x" id="wClose" type="button" aria-label="关闭">
+          <svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor"><line x1="0" y1="0" x2="10" y2="10"/><line x1="10" y1="0" x2="0" y2="10"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="main" id="main">
+      <nav class="view-tabs tabs-idle" id="viewTabs" aria-label="结果视图">
+        <button class="tlink" id="viewCategories" type="button" aria-pressed="true">分类概况</button>
+        <button class="tlink" id="viewDirectories" type="button" aria-pressed="false">目录占用</button>
+        <button class="tlink" id="viewLargeFiles" type="button" aria-pressed="false">大文件</button>
+      </nav>
+
+      <section id="directoryPanel" class="directory-panel" hidden aria-label="目录占用">
+        <div class="directory-heading">
+          <div>
+            <h2 id="directoryTitle">尚未扫描</h2>
+            <p id="directoryStatus" role="status">扫描后按目录查看空间。</p>
+          </div>
+          <div class="dir-more-wrap">
+            <button class="dir-more-btn" id="directoryMoreBtn" type="button" aria-label="更多操作" aria-expanded="false" title="更多操作">⋯</button>
+            <div class="dir-more-menu" id="directoryMoreMenu" hidden>
+              <button type="button" id="directoryRefresh">重新汇总</button>
+            </div>
+          </div>
+        </div>
+        <nav id="directoryCrumbs" aria-label="目录层级"></nav>
+        <span id="directoryPath" hidden></span>
+        <div id="directorySource" class="directory-legend">
+          <span>只汇总本次已分析的文件；未进入的目录和空目录不在此列。</span>
+        </div>
+        <div class="directory-head" id="directoryHead" hidden>
+          <span>名称</span>
+          <span class="r">大小 · 占比</span>
+          <span class="r col-cnt">文件数</span>
+          <span>判断分布（按大小）</span>
+        </div>
+        <div id="directoryRows" class="directory-rows" aria-busy="false"></div>
+        <div class="directory-footer">
+          <button class="tlink" id="directoryUp" type="button" disabled>‹ 上一级</button>
+          <span id="directoryPage">0 / 0</span>
+          <span class="sp"></span>
+          <button class="tlink" id="directoryPrev" type="button" disabled>上一页</button>
+          <button class="tlink" id="directoryNext" type="button" disabled>下一页 ›</button>
+        </div>
+      </section>
+
+      <section id="largeFilesPanel" class="directory-panel" hidden aria-label="大文件">
+        <div class="directory-heading lf-heading">
+          <div>
+            <h2 id="largeFilesTitle">尚未扫描</h2>
+            <p id="largeFilesStatus" role="status">扫描后按大小查看最大的文件。</p>
+          </div>
+          <div class="lf-mode-switch" id="largeFilesModeSwitch" role="group" aria-label="大文件显示范围">
+            <button type="button" class="lf-mode-btn on" id="lfModeIndep" aria-pressed="true">独立大文件</button>
+            <button type="button" class="lf-mode-btn" id="lfModeChat" aria-pressed="false">聊天接收文件</button>
+            <button type="button" class="lf-mode-btn" id="lfModeAll" aria-pressed="false">含缓存内部文件</button>
+          </div>
+        </div>
+        <div id="largeFilesSource" class="directory-legend">
+          <span>默认已过滤浏览器、桌面软件与开发工具的内部零碎缓存块；点击文件可查看用途、所在位置或单独处理。</span>
+        </div>
+        <div class="directory-head large-files-head" id="largeFilesHead" hidden>
+          <span>名称</span>
+          <span>判断</span>
+          <span class="col-loc">所在位置</span>
+          <span class="r">大小</span>
+        </div>
+        <div id="largeFilesRows" class="directory-rows" aria-busy="false"></div>
+        <div class="directory-footer">
+          <span id="largeFilesPage">0 项</span>
+          <span class="sp"></span>
+          <span>按逻辑大小降序</span>
+        </div>
+      </section>
+
+      <div class="readout" aria-live="off">
+        <span class="num" id="num">—</span>
+        <span class="unit" id="unit"></span>
+        <span class="suffix" id="suffix"></span>
+      </div>
+      <p class="caption" id="caption">选择一个位置，按平会告诉你空间去了哪里。</p>
+      <div class="summary" id="summary"></div>
+      <div class="skipline" id="skipline"></div>
+      <div class="chart" id="chart" role="group" aria-label="分类浮雕"></div>
+      <div class="track" id="track"><span id="trackFill"></span></div>
+      <div class="ptext" id="ptext"></div>
+      <div class="barlist" id="barlist"></div>
+      <div class="controls" id="controls"><span class="note">只读扫描；快扫覆盖浏览器、聊天与桌面软件、着色器、包管理器及过期临时文件。</span></div>
+    </div>
+
+    <div class="scrim" id="scrim"></div>
+    <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="文件明细" tabindex="-1"></aside>
+    <section class="sheet" id="sheet" role="dialog" aria-modal="true" tabindex="-1"></section>
+    <div class="dialog" id="dialog" role="alertdialog" aria-modal="true"></div>
+    <div class="pop" id="legend" role="dialog" aria-label="怎么看这些柱子">
+      <h3>怎么看这些柱子？</h3>
+      <div class="leg"><span class="g">▮</span>柱子高度 = 占用空间（已分析文件的逻辑大小）。</div>
+      <div class="leg"><span class="sw"></span><span><b>● 光滑釉面</b> 符合清理规则</span></div>
+      <div class="leg"><span class="sw review"></span><span><b>◐ 细刻纹</b> 需复核：规则不确定，请你看一眼</span></div>
+      <div class="leg"><span class="sw keep"></span><span><b>○ 哑光带锁</b> 建议保留：按平不会清理</span></div>
+      <div class="leg"><span class="g">↗</span>点击柱子，查看里面的每个文件、完整路径和判断依据。</div>
+      <div style="text-align:right;margin-top:6px"><button class="sbtn" id="legendOk" type="button">知道了</button></div>
+    </div>
+    <div class="tip" id="tip"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="sr-only" id="a11yStatus" role="status" aria-live="polite"></div>
+  </div>
+</div>
+
+<script src="anping-audio.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>can-i-delete</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>assets\app.ico</ApplicationIcon>
+    <LangVersion>5</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Host -->
+    <Compile Include="Host\AssemblyInfo.cs" />
+    <Compile Include="Host\Program.cs" />
+    <Compile Include="Host\AppDataPaths.cs" />
+    <Compile Include="Host\AnPingForm.cs" />
+    <Compile Include="Host\AnPingBridge.cs" />
+
+    <!-- Engine -->
+    <Compile Include="Engine\ScanEngine.cs" />
+    <Compile Include="Engine\ScanSession.cs" />
+    <Compile Include="Engine\ListRow.cs" />
+    <Compile Include="Engine\DirectorySummary.cs" />
+    <Compile Include="Engine\DeleteEngine.cs" />
+    <Compile Include="Engine\DeleteLog.cs" />
+    <Compile Include="Engine\PermanentDelete.cs" />
+    <Compile Include="Engine\RecycleBin.cs" />
+    <Compile Include="Engine\RecycleBackend.cs" />
+    <Compile Include="Engine\FileDetailProbe.cs" />
+
+    <!-- Rules -->
+    <Compile Include="Rules\ChatStorageLocator.cs" />
+    <Compile Include="Rules\CacheRuleRegistry.cs" />
+    <Compile Include="Rules\Rules.cs" />
+    <Compile Include="Rules\Safety.cs" />
+    <Compile Include="Rules\ContentEvidence.cs" />
+    <Compile Include="Rules\CleanSelection.cs" />
+    <Compile Include="Rules\ScanText.cs" />
+    <Compile Include="Rules\AnPingExplanation.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="assets\logo.png">
+      <LogicalName>AppLogo</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="Microsoft.Web.WebView2.Core">
+      <HintPath>lib\Microsoft.Web.WebView2.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Web.WebView2.WinForms">
+      <HintPath>lib\Microsoft.Web.WebView2.WinForms.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="WebView2Loader.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ui\index.html" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ui\styles.css" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ui\app.js" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="ui\anping-audio.js" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,14 @@
+46dfa14c199bf86d757492d150c6cdbe8506745664f183957ad3a6e8f0b5c82d  按平-v1.0.0-win-x64-portable.zip
+f6676ee0675f1ede78e1b511e142331ec573d76a86cf139a2eec2ad0b6ea068a  RELEASE-NOTES.md
+3b84bfc3d1fdc09cce4602abd9ea99ac8ca39037d1b0584a5148fe1b91f8bc1c  RELEASE-PAGE.md
+ed58704911f84ea307cb57df08eaf286e0d4d2b006e579619ca8b5fea2d11fcb  BUILD-INFO.txt
+d26bf7ada28f518a7b800d18d2c75080eeb8a1d258b85299c09aea697f9e3e61  按平-v1.0.0-win-x64-portable/can-i-delete.exe
+462b36fd1be6ca9f7563466a89e57c41ef4a4def3e0a84fa885d203aea4a3aaf  按平-v1.0.0-win-x64-portable/WebView2Loader.dll
+6b5b407e72cf77a5a290dfb6f4e8d66d8255ef99a6402be11158d3476b13418d  按平-v1.0.0-win-x64-portable/LICENSE
+b8630712e4a24269abafe32aeaaad666cc92e5656a09464090832c94f51fa368  按平-v1.0.0-win-x64-portable/README.md
+88a3b62f45225a811cdb85df6dfd95c2bff9a0e43e3b04f813b125eaca56cc9f  按平-v1.0.0-win-x64-portable/lib/Microsoft.Web.WebView2.Core.dll
+29fc954c3fde1749817d158f3dd5ebe9efd3b3ce9708d86092fb1e9f023a1cb0  按平-v1.0.0-win-x64-portable/lib/Microsoft.Web.WebView2.WinForms.dll
+d190cf9524a3bc1fd84f2182794923debdd914efa82ce7d295f08edf410a3edf  按平-v1.0.0-win-x64-portable/ui/anping-audio.js
+e615f8e1afc363e33534d1a60f59ee410992f94ce25c6d3f42134842f6aa6b03  按平-v1.0.0-win-x64-portable/ui/app.js
+2a977bfdf1bd456d94caf5caf76e3b1da76c346ff823262ddd5b4bb65a3991d8  按平-v1.0.0-win-x64-portable/ui/index.html
+225582407ef4ea2477b470cca3753dc8c8d93558e9a9a8635efa91af9b98c298  按平-v1.0.0-win-x64-portable/ui/styles.css

@@ -1,0 +1,17 @@
+AnPing (can-i-delete) v1.0.0
+Repository: https://github.com/Feli999ovo/can-i-delete
+Build UTC: 2026-11-23T16:47:55Z
+Assembly version: 1.0.0.0
+File version: 1.0.0.0
+EXE bytes: 445952
+EXE SHA-256: d26bf7ada28f518a7b800d18d2c75080eeb8a1d258b85299c09aea697f9e3e61
+ZIP file: 按平-v1.0.0-win-x64-portable.zip
+ZIP bytes: 493705
+ZIP SHA-256: 46dfa14c199bf86d757492d150c6cdbe8506745664f183957ad3a6e8f0b5c82d
+Target OS: Windows 10 / Windows 11 x64
+Runtime: .NET Framework 4.8+; Microsoft Edge WebView2 Runtime
+Compiler: .NET Framework 4.x csc.exe (-langversion:5 -warnaserror)
+Permanent batch cleaning: 10 CacheRuleRegistry verified cache rules
+Single-file recycle: STA IFileOperation (FOFX_RECYCLEONDELETE) for non-keep files
+Required adjacent files: WebView2Loader.dll, lib\ (Microsoft.Web.WebView2.Core.dll, Microsoft.Web.WebView2.WinForms.dll), ui\ (index.html, styles.css, app.js, anping-audio.js)
+Authenticode: NotSigned
