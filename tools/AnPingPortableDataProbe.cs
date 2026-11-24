@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Diagnostics;
 using System.Windows.Forms;
@@ -33,6 +35,36 @@ class AnPingPortableDataProbe
             catch (UnauthorizedAccessException) { refused = true; }
             Check("unwritable data is refused without GUI or sound", refused);
             Check("no profile override on failed setup", Environment.GetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER") == Environment.GetEnvironmentVariable("PORTABLE_FORBIDDEN_PROFILE"));
+            return 0;
+        }
+        if (mode == "denied")
+        {
+            string dataDir = AppDataPaths.Root;
+            if (!Directory.Exists(dataDir)) throw new InvalidOperationException("denied mode requires existing data directory: " + dataDir);
+            var restricted = Directory.GetAccessControl(dataDir, AccessControlSections.Access);
+            SecurityIdentifier sid;
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                if (identity == null || identity.User == null) throw new InvalidOperationException("Unable to determine current Windows user SID.");
+                sid = identity.User;
+            }
+            var denyRule = new FileSystemAccessRule(sid, FileSystemRights.Write, AccessControlType.Deny);
+            restricted.AddAccessRule(denyRule);
+            Directory.SetAccessControl(dataDir, restricted);
+            try
+            {
+                bool refused = false;
+                try { AppDataPaths.Prepare(); }
+                catch (IOException) { refused = true; }
+                catch (UnauthorizedAccessException) { refused = true; }
+                Check("write-denied data is refused without GUI or sound", refused);
+                Check("no profile override on denied setup", Environment.GetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER") == Environment.GetEnvironmentVariable("PORTABLE_FORBIDDEN_PROFILE"));
+            }
+            finally
+            {
+                restricted.RemoveAccessRuleSpecific(denyRule);
+                Directory.SetAccessControl(dataDir, restricted);
+            }
             return 0;
         }
         Application.EnableVisualStyles();

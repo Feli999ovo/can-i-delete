@@ -1,10 +1,5 @@
 "use strict";
 
-/* ================= audit probe hook ================= */
-if (typeof window !== "undefined") {
-  window.__auditEval = function(code) { return eval(code); };
-}
-
 /* ================= helpers ================= */
 var CATS = [];
 var $ = function(id) { return document.getElementById(id); };
@@ -15,7 +10,8 @@ function unitOf(gb) {
   return b < 1024 ? "B" : b < 1048576 ? "KB" : b < 1073741824 ? "MB" : b < 1099511627776 ? "GB" : "TB";
 }
 function inUnit(gb, u) {
-  return gb * 1073741824 / ({ B: 1, KB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 }[u]);
+  var div = u === "B" ? 1 : u === "KB" ? 1024 : u === "MB" ? 1048576 : u === "GB" ? 1073741824 : 1099511627776;
+  return gb * 1073741824 / div;
 }
 function num3(n, u) {
   if (n === 0) return "0";
@@ -29,21 +25,41 @@ function fmt(gb) {
 function fs(gb) { var f = fmt(gb); return f.n + " " + f.u; }
 function sh(gb) { var f = fmt(gb); return f.u === "GB" ? f.n : f.n + " " + f.u; }
 function esc(s) {
-  return String(s).replace(/[&<>"]/g, function(c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c) {
+    return c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;";
   });
+}
+function hasOwn(o, k) { return o != null && Object.prototype.hasOwnProperty.call(o, k); }
+function safeInt(v) { var n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : 0; }
+function cssAttrVal(s) {
+  return String(s == null ? "" : s).replace(/[\0-\x1f\x7f\\"]/g, function(ch) {
+    return (ch === "\\" || ch === '"') ? ("\\" + ch) : ("\\" + ch.charCodeAt(0).toString(16) + " ");
+  });
+}
+function cssEsc(s) {
+  var str = String(s == null ? "" : s);
+  if (typeof CSS !== "undefined" && CSS && typeof CSS.escape === "function") return CSS.escape(str);
+  return str.replace(/(?:^\d)|[^A-Za-z0-9_-]/g, function(ch) {
+    return "\\" + ch.charCodeAt(0).toString(16) + " ";
+  });
+}
+function safeQuery(rootEl, sel) {
+  if (!rootEl || !sel || typeof rootEl.querySelector !== "function") return null;
+  try { return rootEl.querySelector(sel); } catch (_) { return null; }
 }
 function wbrPath(p) { return esc(p).replace(/\\/g, "\\<wbr>"); }
 function midDir(p) {
-  var parts = String(p).replace(/[\\/]$/, "").split(/[\\/]/);
-  return parts.length <= 2 ? p : parts[0] + "\\…\\" + parts[parts.length - 1] + "\\";
+  var parts = String(p == null ? "" : p).replace(/[\\/]$/, "").split(/[\\/]/);
+  return parts.length <= 2 ? String(p == null ? "" : p) : parts[0] + "\\…\\" + parts[parts.length - 1] + "\\";
 }
 function midPath(p) {
   var s = String(p || "");
   return s.length <= 56 ? s : s.slice(0, 22) + "…" + s.slice(-30);
 }
-var G = { ok: "●", review: "◐", keep: "○" };
-var JL = { ok: "符合清理规则", review: "需复核", keep: "建议保留" };
+var G = Object.assign(Object.create(null), { ok: "●", review: "◐", keep: "○" });
+var JL = Object.assign(Object.create(null), { ok: "符合清理规则", review: "需复核", keep: "建议保留" });
+function judgeGlyph(j) { return hasOwn(G, j) ? G[j] : "○"; }
+function judgeLabel(j) { return hasOwn(JL, j) ? JL[j] : "未知"; }
 
 var motionQuery = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
 var contrastQuery = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(forced-colors: active)");
@@ -103,10 +119,10 @@ function tick(now) {
 var S = {
   state: "first",
   mode: "readonly",
-  found: {},
-  moved: {},
-  failed: {},
-  selected: {},
+  found: Object.create(null),
+  moved: Object.create(null),
+  failed: Object.create(null),
+  selected: Object.create(null),
   legendSeen: false,
   stopped: false,
   phase: "idle",
@@ -159,7 +175,7 @@ function canOfferElevate() {
 }
 function elevateRowHTML(id) {
   if (!canOfferElevate()) return "";
-  return '<button class="tlink elevate-link" type="button" id="' + (id || "elevateBtn") + '">以管理员身份重开（可多扫系统更新与系统 Temp）</button>';
+  return '<button class="tlink elevate-link" type="button" id="' + esc(id || "elevateBtn") + '">以管理员身份重开（可多扫系统更新与系统 Temp）</button>';
 }
 function requestRelaunchAdmin(mode) {
   if (S.elevating || S.cleaning) return;
@@ -204,9 +220,10 @@ var GROUPS = groups();
 function gv(g) {
   var o = { ok: 0, review: 0, keep: 0, orig: 0, okOrig: 0 };
   g.cats.forEach(function(c) {
-    var f = S.found[c.id];
-    var delGb = (S.cleaning && S.cleanByCat && S.cleanByCat[c.id]) ? S.cleanByCat[c.id] / 1073741824 : 0;
-    var okRem = c.ok * f - S.moved[c.id] - delGb;
+    var f = hasOwn(S.found, c.id) ? (Number(S.found[c.id]) || 0) : 0;
+    var moved = hasOwn(S.moved, c.id) ? (Number(S.moved[c.id]) || 0) : 0;
+    var delGb = (S.cleaning && S.cleanByCat && hasOwn(S.cleanByCat, c.id)) ? (Number(S.cleanByCat[c.id]) || 0) / 1073741824 : 0;
+    var okRem = c.ok * f - moved - delGb;
     o.ok += Math.max(0, okRem);
     o.review += c.review * f;
     o.keep += c.keep * f;
@@ -216,7 +233,7 @@ function gv(g) {
   o.total = o.ok + o.review + o.keep;
   return o;
 }
-function gSelected(g) { return g.cats.some(function(c) { return c.ok > 0 && S.selected[c.id]; }); }
+function gSelected(g) { return g.cats.some(function(c) { return c.ok > 0 && hasOwn(S.selected, c.id) && !!S.selected[c.id]; }); }
 function gSelectable(g) { return g.cats.some(function(c) { return c.ok > 0; }); }
 
 function buildSlots() {
@@ -279,26 +296,26 @@ function buildSlots() {
 }
 buildSlots();
 
+var SHORT_NAMES = Object.assign(Object.create(null), {
+  pkg: "开发包管理器缓存",
+  br: "浏览器缓存",
+  app: "桌面软件缓存",
+  thumb: "缩略图与图标缓存",
+  shader: "图形与着色器缓存",
+  systmp: "系统与软件临时文件",
+  dump: "系统转储与诊断日志",
+  user: "受保护系统/用户数据",
+  tmp: "其他未识别文件",
+  wx: "聊天软件缓存",
+  winupd: "系统更新缓存",
+  upd: "应用程序更新残留",
+  dl: "未完成下载残留",
+  draft: "办公草稿与自动保存",
+  log: "安装与系统更新日志"
+});
 function shortName(g) {
   if (g.group) return g.name;
-  var names = {
-    pkg: "开发包管理器缓存",
-    br: "浏览器缓存",
-    app: "桌面软件缓存",
-    thumb: "缩略图与图标缓存",
-    shader: "图形与着色器缓存",
-    systmp: "系统与软件临时文件",
-    dump: "系统转储与诊断日志",
-    user: "受保护系统/用户数据",
-    tmp: "其他未识别文件",
-    wx: "聊天软件缓存",
-    winupd: "系统更新缓存",
-    upd: "应用程序更新残留",
-    dl: "未完成下载残留",
-    draft: "办公草稿与自动保存",
-    log: "安装与系统更新日志"
-  };
-  return (g.cats[0] && g.cats[0].short) || names[g.id] || g.name;
+  return (g.cats[0] && g.cats[0].short) || (hasOwn(SHORT_NAMES, g.id) ? SHORT_NAMES[g.id] : "") || g.name;
 }
 function labelHeight(hidden) {
   return 16 + 32 * textScale() + 4 + 20 * textScale() + (hidden ? 0 : 4 + 48 * textScale());
@@ -443,8 +460,9 @@ function setText(n, u) {
 function totals() {
   var o = { ok: 0, review: 0, keep: 0, all: 0 };
   CATS.forEach(function(c) {
-    var f = S.found[c.id];
-    o.ok += Math.max(0, c.ok * f - S.moved[c.id]);
+    var f = hasOwn(S.found, c.id) ? (Number(S.found[c.id]) || 0) : 0;
+    var moved = hasOwn(S.moved, c.id) ? (Number(S.moved[c.id]) || 0) : 0;
+    o.ok += Math.max(0, c.ok * f - moved);
     o.review += c.review * f;
     o.keep += c.keep * f;
   });
@@ -453,11 +471,11 @@ function totals() {
 }
 function lockedCacheHintHTML() {
   if (!(S.lockedCacheBytes > 0)) return "";
-  return '<div class="locked-note" id="lockedCacheNote">另有 <b>' + fs(S.lockedCacheBytes / 1073741824) + "</b> 缓存正被运行中的程序（如浏览器）占用，关闭对应程序后重扫可一并清理</div>";
+  return '<div class="locked-note" id="lockedCacheNote">另有 <b>' + esc(fs(S.lockedCacheBytes / 1073741824)) + "</b> 缓存正被运行中的程序（如浏览器）占用，关闭对应程序后重扫可一并清理</div>";
 }
 function summaryRest(t) {
-  return '<span class="k"><span class="g">◐</span><b>' + fs(t.review) + '</b> 需复核</span>' +
-    '<span class="k"><span class="g">○</span><b>' + fs(t.keep) + '</b> 建议保留</span>' +
+  return '<span class="k"><span class="g">◐</span><b>' + esc(fs(t.review)) + '</b> 需复核</span>' +
+    '<span class="k"><span class="g">○</span><b>' + esc(fs(t.keep)) + '</b> 建议保留</span>' +
     '<button class="tlink" id="legendBtn" type="button">怎么看这些柱子？</button>' +
     elevateRowHTML("elevateBtn") +
     lockedCacheHintHTML();
@@ -465,18 +483,22 @@ function summaryRest(t) {
 function renderCleanBand(b) {
   var chk = '<span class="check draw"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6.4l2.6 2.6L10 3.4"/></svg></span>';
   var btn = ' · <button class="tlink" type="button" id="cleanDetailBtn">查看明细</button>';
-  var sz = fs((b.freedBytes || 0) / 1073741824);
+  var deleted = Math.max(0, safeInt(b.deleted));
+  var attempted = Math.max(0, safeInt(b.attempted));
+  var notExecuted = Math.max(0, safeInt(b.notExecuted));
+  var unknown = Math.max(0, safeInt(b.unknown));
+  var sz = esc(fs((Number(b.freedBytes) || 0) / 1073741824));
   if (b.stopped) {
-    var rest = b.notExecuted + " 个未处理，保持原样" + (b.otherParts && b.otherParts.length ? "；" + b.otherParts.join(" · ") : "");
-    return '<div class="result-band" role="status"><div class="rb-lines"><div class="rb-main">已停止。已永久删除 ' + b.deleted + " 个文件，共 " + sz + "（文件大小合计）；其余 " + esc(rest) + btn + "</div></div></div>";
+    var rest = notExecuted + " 个未处理，保持原样" + (Array.isArray(b.otherParts) && b.otherParts.length ? "；" + b.otherParts.join(" · ") : "");
+    return '<div class="result-band" role="status"><div class="rb-lines"><div class="rb-main">已停止。已永久删除 ' + deleted + " 个文件，共 " + sz + "（文件大小合计）；其余 " + esc(rest) + btn + "</div></div></div>";
   }
-  if (b.deleted === 0) {
+  if (deleted === 0) {
     return '<div class="result-band" role="status"><div class="rb-lines"><div class="rb-main">没有删除任何文件：' + esc(b.subText || "文件正在使用或状态已变化") + btn + "</div></div></div>";
   }
-  if (b.deleted < b.attempted || b.unknown > 0) {
-    return '<div class="result-band" role="status">' + chk + '<div class="rb-lines"><div class="rb-main"><b>已永久删除 ' + b.deleted + " 个文件，共 " + sz + '</b>（文件大小合计）</div><div class="rb-sub">' + esc(b.subText) + btn + "</div></div></div>";
+  if (deleted < attempted || unknown > 0) {
+    return '<div class="result-band" role="status">' + chk + '<div class="rb-lines"><div class="rb-main"><b>已永久删除 ' + deleted + " 个文件，共 " + sz + '</b>（文件大小合计）</div><div class="rb-sub">' + esc(b.subText) + btn + "</div></div></div>";
   }
-  return '<div class="result-band" role="status">' + chk + '<div class="rb-lines"><div class="rb-main"><b>已永久删除 ' + b.deleted + " 个文件，共 " + sz + "</b>（文件大小合计）</div></div></div>";
+  return '<div class="result-band" role="status">' + chk + '<div class="rb-lines"><div class="rb-main"><b>已永久删除 ' + deleted + " 个文件，共 " + sz + "</b>（文件大小合计）</div></div></div>";
 }
 
 function render(snap) {
@@ -557,12 +579,12 @@ function render(snap) {
   }
 
   if (!S.cleaning && S.coverage) {
-    var scannedDirs = S.coverage.DirectoriesStarted || S.directoryCount || 0;
+    var scannedDirs = safeInt(S.coverage.DirectoriesStarted || S.directoryCount || 0);
     var dirNote = S.incomplete ? "（含起始目录，已自动跳过无权限或系统保护位置）" : "（含起始目录）";
-    var warnPrefix = S.analysisWarning ? ("⚠ " + (S.failedItems || 1) + " 项分析失败未计入 · ") : "";
+    var warnPrefix = S.analysisWarning ? ("⚠ " + Math.max(1, safeInt(S.failedItems)) + " 项分析失败未计入 · ") : "";
     var skipLabel = (S.incomplete || S.analysisWarning) ? "查看跳过项" : "扫描范围";
     skip = '<span class="' + (S.analysisWarning ? "warn" : "") + '">' + warnPrefix +
-      "已检查 " + fmtCount(S.fileCount || 0) + " 个文件 · 共扫描 " + fmtCount(scannedDirs) + " 个文件夹" + dirNote +
+      "已检查 " + esc(fmtCount(safeInt(S.fileCount))) + " 个文件 · 共扫描 " + esc(fmtCount(scannedDirs)) + " 个文件夹" + dirNote +
       '</span><span>·</span><button class="tlink' + (S.analysisWarning ? " warn" : "") + '" type="button" id="skipBtn">' + skipLabel + "</button>";
   }
 
@@ -719,10 +741,10 @@ function drawCleanList() {
         '<input class="sr-check" type="checkbox" id="' + esc(id) + '" data-clean-rule="' + esc(g.rule) + '" ' + (needSub ? "" : "checked") + '>' +
         '<span class="pcheck" aria-hidden="true"></span></label>' +
         '<div class="clean-group-body">' +
-        '<label class="clean-head" for="' + esc(id) + '"><b>' + esc(g.title) + '</b><span>' + fmtCount(g.count) + " 个文件 · " + fs(g.bytes / 1073741824) + "</span></label>" +
+        '<label class="clean-head" for="' + esc(id) + '"><b>' + esc(g.title) + '</b><span>' + esc(fmtCount(safeInt(g.count))) + " 个文件 · " + esc(fs((Number(g.bytes) || 0) / 1073741824)) + "</span></label>" +
         (g.cost ? '<p class="clean-cost">' + esc(g.cost) + "</p>" : "") +
         (needSub ? '<label class="dump-confirm-row" id="' + esc(rowId) + '" data-confirm-row="' + esc(g.rule) + '" hidden><span class="clean-check-wrap"><input class="sr-check" type="checkbox" id="' + esc(subId) + '" data-confirm-for="' + esc(g.rule) + '"><span class="pcheck" aria-hidden="true"></span></span><span>' + esc(g.confirmLabel) + "</span></label>" : "") +
-        '<details class="clean-locs"><summary>位置（' + g.locations.length + " 处）</summary>" +
+        '<details class="clean-locs"><summary>位置（' + safeInt(g.locations.length) + " 处）</summary>" +
         g.locations.map(function(p) { return '<p class="sel">' + esc(p) + "</p>"; }).join("") +
         "</details></div></section>";
     }).join("") +
@@ -731,11 +753,12 @@ function drawCleanList() {
   function computeEffective() {
     var eff = [], confirmedRules = [], pendingConfirm = false;
     cleanList.groups.forEach(function(g) {
-      var mainChk = dlg.querySelector('[data-clean-rule="' + g.rule + '"]');
+      var ruleSel = cssAttrVal(g.rule);
+      var mainChk = safeQuery(dlg, '[data-clean-rule="' + ruleSel + '"]');
       var mainOn = !!(mainChk && mainChk.checked);
       if (g.requiresConfirm) {
-        var row = dlg.querySelector('[data-confirm-row="' + g.rule + '"]');
-        var subChk = dlg.querySelector('[data-confirm-for="' + g.rule + '"]');
+        var row = safeQuery(dlg, '[data-confirm-row="' + ruleSel + '"]');
+        var subChk = safeQuery(dlg, '[data-confirm-for="' + ruleSel + '"]');
         if (row) row.hidden = !mainOn;
         if (subChk) {
           subChk.disabled = !mainOn;
@@ -767,7 +790,7 @@ function drawCleanList() {
     inp.onchange = function() {
       update();
       if (inp.dataset && inp.dataset.cleanRule && inp.checked) {
-        var confirmRow = dlg.querySelector('[data-confirm-row="' + inp.dataset.cleanRule + '"]');
+        var confirmRow = safeQuery(dlg, '[data-confirm-row="' + cssAttrVal(inp.dataset.cleanRule) + '"]');
         if (confirmRow && !confirmRow.hidden && typeof confirmRow.scrollIntoView === "function") {
           confirmRow.scrollIntoView({ block: "nearest", behavior: RM ? "auto" : "smooth" });
         }
@@ -791,7 +814,7 @@ function drawCleanList() {
       var full = g.cats.reduce(function(a, c) { return a + c.total; }, 0);
       S.cleanMaxT = Math.max(S.cleanMaxT, full);
     });
-    S.cleanByCat = {};
+    S.cleanByCat = Object.create(null);
     S.cleanDetail = { deleted: 0, deletedBytes: 0, currentPath: "" };
     closeDialogModal();
     S.cleaning = true;
@@ -819,10 +842,11 @@ function showCleanProblems(msg, lead, title) {
   var dlg = $("dialog");
   dlg.classList.remove("clean-dlg", "recycle-dlg");
   dlg.removeAttribute("aria-describedby");
-  var list = msg.items && msg.items.length ? msg.items : (msg.problems || []);
+  var list = (msg && Array.isArray(msg.items) && msg.items.length) ? msg.items : ((msg && Array.isArray(msg.problems)) ? msg.problems : []);
   var rows = list.map(function(p) {
-    var tag = p.status === "DeletedVerified" ? "已删除" : (p.status === "NotExecutedDueToStop" ? "未处理" : "未删除");
-    return "<li><b>[" + tag + "] " + esc(p.name) + "</b>：" + esc(p.detail) + "</li>";
+    var item = p && typeof p === "object" ? p : {};
+    var tag = item.status === "DeletedVerified" ? "已删除" : (item.status === "NotExecutedDueToStop" ? "未处理" : "未删除");
+    return "<li><b>[" + tag + "] " + esc(item.name) + "</b>：" + esc(item.detail) + "</li>";
   }).join("");
   // pi-lens-ignore: no-inner-html-js
   dlg.innerHTML = "<h2>" + esc(title || "清理明细") + "</h2>" +
@@ -980,6 +1004,8 @@ function openSheetInner(html) {
   }
 }
 
+var nativeDrives = [], nativeChatFolders = [];
+
 function openPicker(preferMode) {
   closeDrawer();
   S.prevState = S.state;
@@ -987,8 +1013,8 @@ function openPicker(preferMode) {
   pickerMode = typeof preferMode === "string" ? preferMode : "quick";
 
   REFRESH_PICKER = function() {
-    var drives = (typeof window !== "undefined" && window.NATIVE_DRIVES) ? window.NATIVE_DRIVES : [];
-    var chatFolders = (typeof window !== "undefined" && Array.isArray(window.NATIVE_CHAT_FOLDERS)) ? window.NATIVE_CHAT_FOLDERS : [];
+    var drives = nativeDrives;
+    var chatFolders = nativeChatFolders;
     if (pickerMode === "chat" && !chatFolders.length) pickerMode = "quick";
     var quickOn = pickerMode === "quick";
     var chatOn = pickerMode === "chat" && chatFolders.length > 0;
@@ -1031,7 +1057,7 @@ function openPicker(preferMode) {
       driveRows +
       '<button class="rowbtn row" type="button" id="addFolder"><span class="g">＋</span><span class="nm">添加文件夹</span></button></div>' +
       '<div class="sheet-foot">' +
-      '<span class="sp sub" style="margin:0">' + (any ? "" : "至少选择一个位置") + "</span>" +
+      '<span class="sp sub sheet-hint">' + (any ? "" : "至少选择一个位置") + "</span>" +
       '<button class="tlink" type="button" id="pkCancel">取消</button>' +
       '<button class="pill" type="button" id="pkGo" ' + (any ? "" : "disabled") + ">开始扫描</button></div>"
     );
@@ -1050,7 +1076,7 @@ function openPicker(preferMode) {
           drives.forEach(function(d, idx) { d.selected = idx === +key; });
         }
         REFRESH_PICKER();
-        var focusBtn = sheet.querySelector('[data-i="' + key + '"]');
+        var focusBtn = safeQuery(sheet, '[data-i="' + cssAttrVal(key) + '"]');
         if (focusBtn) focusBtn.focus({ preventScroll: true });
       };
     });
@@ -1186,7 +1212,7 @@ function onBar(sl) {
 
 /* ================= drawer & single-file recycle ================= */
 var drawer = $("drawer"), drawerOpen = false;
-var dState = { g: null, filter: "all", sort: "size", open: {} };
+var dState = { g: null, filter: "all", sort: "size", open: Object.create(null) };
 var drSp = new Spring(104, function(x) {
   drawer.style.transform = "translateX(" + x + "%)";
   var p = 1 - Math.min(1, Math.max(0, x / 104));
@@ -1244,7 +1270,7 @@ function openDrawer(g, waitSnapshot) {
   hideTip();
   tock();
   lastFocus = document.activeElement;
-  dState = { g: g, catId: "other", filter: "all", sort: "size", open: {}, waitSnapshot: !!waitSnapshot };
+  dState = { g: g, catId: "other", filter: "all", sort: "size", open: Object.create(null), waitSnapshot: !!waitSnapshot };
   drawerOpen = true;
   overlay = "drawer";
   if (waitSnapshot) { dState.loading = true; dState.page = null; drawRender(); }
@@ -1347,7 +1373,7 @@ function applyFileTech(msg) {
   ["created", "accessed", "attributes", "process"].forEach(function(k) {
     if (typeof msg[k] === "string" && msg[k]) {
       f.x[k] = msg[k];
-      var dd = body && body.querySelector('[data-tech="' + k + '"]');
+      var dd = body && safeQuery(body, '[data-tech="' + cssAttrVal(k) + '"]');
       if (dd) {
         dd.textContent = msg[k];
         dd.classList.toggle("u", /未读取|未检查|未知/.test(msg[k]));
@@ -1364,7 +1390,7 @@ function backToList() {
   var key = dState.detailKey, scroll = dState.listScroll;
   clearDetailSprings();
   dState.detailKey = null;
-  dState.focusToken = key ? '[data-k="' + key.replace(/"/g, '\\"') + '"] .fhead' : ".fhead";
+  dState.focusToken = key ? '[data-k="' + cssAttrVal(key) + '"] .fhead' : ".fhead";
   drawRender();
   var row = Array.from(drawer.querySelectorAll(".file")).find(function(el) { return el.dataset.k === key; });
   if ($("flist")) $("flist").scrollTop = scroll || 0;
@@ -1372,10 +1398,11 @@ function backToList() {
 }
 
 function confidenceHTML(label) {
+  var safe = esc(label);
   var n = label === "已确认" ? 3 : label === "很可能" ? 2 : 0;
-  return '<span class="conf" aria-label="可信程度：' + label + '">' +
+  return '<span class="conf" aria-label="可信程度：' + safe + '">' +
     [0, 1, 2].map(function(i) { return '<i class="' + (i < n ? "f" : "") + '" aria-hidden="true"></i>'; }).join("") +
-    "<span>" + label + "</span></span>";
+    "<span>" + safe + "</span></span>";
 }
 function reviewMarkHTML(f) {
   if (f.j !== "review") return "";
@@ -1516,11 +1543,15 @@ function drawDetail() {
     ? '<button class="sbtn" type="button" data-a="recycle"' + (recyclingThis ? " disabled" : "") + ">" + (recyclingThis ? "正在移入回收站…" : "移入回收站") + "</button>"
     : "";
 
-  var h = '<div class="dvbar"><button class="back" type="button" id="detailBack" title="Esc / Backspace">‹ 返回列表</button><span class="pos">' + ((page ? page.offset : 0) + position + 1) + " / " + (page ? page.total : files.length) + '</span></div><div class="dv file" data-k="' + esc(dState.detailKey) + '"><h2 class="fn sel">' + esc(f.n) + '</h2><div class="fmeta">' + fs(f.s) + " · 修改于 " + esc(f.mt) + " · " + esc(catLabel) + '</div><span class="chip">' + G[f.j] + " " + JL[f.j] + "</span>";
+  var posNum = (page ? safeInt(page.offset) : 0) + position + 1;
+  var totNum = page ? safeInt(page.total) : files.length;
+  var stepsList = Array.isArray(d.steps) ? d.steps : [];
+  var evList = Array.isArray(d.evidence) ? d.evidence : [];
+  var h = '<div class="dvbar"><button class="back" type="button" id="detailBack" title="Esc / Backspace">‹ 返回列表</button><span class="pos">' + posNum + " / " + totNum + '</span></div><div class="dv file" data-k="' + esc(dState.detailKey) + '"><h2 class="fn sel">' + esc(f.n) + '</h2><div class="fmeta">' + esc(fs(f.s)) + " · 修改于 " + esc(f.mt) + " · " + esc(catLabel) + '</div><span class="chip">' + esc(judgeGlyph(f.j)) + " " + esc(judgeLabel(f.j)) + "</span>";
   h += '<section class="blk"><h3>这是什么</h3><div class="typ"><b>' + esc(d.type) + "</b>" + confidenceHTML(d.confidence) + "</div><p>" + esc(d.purpose) + '</p><div class="basis">判断依据：' + esc(d.basis) + "</div></section>";
   h += '<section class="blk"><h3>删除会怎样</h3><div class="risk">' + esc(d.risk) + "</div><p>" + esc(d.riskText) + "</p></section>";
-  h += '<section class="blk"><h3>建议你</h3><ol class="steps">' + d.steps.map(function(s) { return "<li>" + esc(s) + "</li>"; }).join("") + '</ol><div class="acts"><button class="sbtn" type="button" data-a="reveal">在资源管理器中显示</button><button class="sbtn" type="button" data-a="copy">复制路径</button>' + recycleBtn + "</div></section>";
-  h += '<section class="blk"><h3>为什么这样判断</h3><ul class="ev">' + d.evidence.map(function(e) { return '<li><span class="st ' + (e.state === "u" ? "u" : "") + '">' + ({ y: "✓", n: "✕", u: "?" }[e.state]) + "</span><span>" + esc(e.text) + '</span><span class="str">' + esc(e.strength) + "</span></li>"; }).join("") + '</ul><div class="rulenote">原有规则 ' + esc(f.x.ruleId || f.r) + " · 标“?”的项目没有检查，不参与判断。用途说明不改变真实分类或执行许可。</div>" + (d.source ? '<p class="rulenote sel">' + esc(d.source) + "<br>" + esc(d.sourceUrl) + "</p>" : "") + reviewMarkHTML(f) + "</section>";
+  h += '<section class="blk"><h3>建议你</h3><ol class="steps">' + stepsList.map(function(s) { return "<li>" + esc(s) + "</li>"; }).join("") + '</ol><div class="acts"><button class="sbtn" type="button" data-a="reveal">在资源管理器中显示</button><button class="sbtn" type="button" data-a="copy">复制路径</button>' + recycleBtn + "</div></section>";
+  h += '<section class="blk"><h3>为什么这样判断</h3><ul class="ev">' + evList.map(function(e) { var ev = e && typeof e === "object" ? e : {}; var stGlyph = ev.state === "y" ? "✓" : (ev.state === "n" ? "✕" : "?"); return '<li><span class="st ' + (ev.state === "u" ? "u" : "") + '">' + stGlyph + "</span><span>" + esc(ev.text) + '</span><span class="str">' + esc(ev.strength) + "</span></li>"; }).join("") + '</ul><div class="rulenote">原有规则 ' + esc(f.x.ruleId || f.r) + " · 标“?”的项目没有检查，不参与判断。用途说明不改变真实分类或执行许可。</div>" + (d.source ? '<p class="rulenote sel">' + esc(d.source) + (d.sourceUrl ? "<br>" + esc(d.sourceUrl) : "") + "</p>" : "") + reviewMarkHTML(f) + "</section>";
   h += '<section class="tech"><button class="tech-toggle" type="button" id="techToggle" aria-expanded="false" aria-controls="techBody">› 技术详情</button><div class="tech-body" id="techBody" inert aria-hidden="true"><div class="tech-content"><div class="path sel">' + wbrPath((f.p || "") + f.n) + '</div><dl class="tkv">' +
     [
       ["精确大小", typeof f.x.bytes === "number" ? f.x.bytes.toLocaleString("en-US") + " 字节" : "未读取"],
@@ -1613,37 +1644,48 @@ function baseDrawerRender() {
     });
   }
   var title = dState.groupName || (g ? g.name : "全部文件"), ok = 0, rv = 0, kp = 0;
-  var cnt = { all: 0, ok: 0, review: 0, keep: 0 };
+  var cnt = Object.assign(Object.create(null), { all: 0, ok: 0, review: 0, keep: 0 });
   cats.forEach(function(c) {
     ok += c.ok; rv += c.review; kp += c.keep;
-    (c.files || []).forEach(function(f) { cnt.all++; cnt[f.j]++; });
+    (c.files || []).forEach(function(f) { cnt.all++; if (hasOwn(cnt, f.j)) cnt[f.j]++; });
   });
   if (nativeDetail()) {
-    cnt = page ? page.counts : { all: cats.reduce(function(n, c) { return n + (c.count || 0); }, 0), ok: "—", review: "—", keep: "—" };
+    var pc = page && page.counts && typeof page.counts === "object" ? page.counts : null;
+    cnt = Object.assign(Object.create(null), pc
+      ? {
+          all: pc.all === "—" ? "—" : safeInt(pc.all),
+          ok: pc.ok === "—" ? "—" : safeInt(pc.ok),
+          review: pc.review === "—" ? "—" : safeInt(pc.review),
+          keep: pc.keep === "—" ? "—" : safeInt(pc.keep)
+        }
+      : { all: cats.reduce(function(n, c) { return n + safeInt(c.count); }, 0), ok: "—", review: "—", keep: "—" });
   }
   var h = '<div class="dhead"><div class="t"><h2>' + esc(title) + '</h2><div class="dtot">' +
-    (page && typeof page.logicalBytes === "number" ? fs(page.logicalBytes / 1073741824) + " 逻辑大小" : fs(ok + rv + kp) + (ok ? " · ● " + sh(ok) : "") + (rv ? " · ◐ " + sh(rv) : "") + (kp ? " · ○ " + sh(kp) : "")) +
+    (page && typeof page.logicalBytes === "number" ? esc(fs(page.logicalBytes / 1073741824)) + " 逻辑大小" : esc(fs(ok + rv + kp)) + (ok ? " · ● " + esc(sh(ok)) : "") + (rv ? " · ◐ " + esc(sh(rv)) : "") + (kp ? " · ○ " + esc(sh(kp)) : "")) +
     "</div>" + (g && g.group ? '<div class="dtot">包含：' + esc(g.cats.map(function(c) { return c.name; }).join("、")) + "</div>" : "") +
     '</div><button class="close" type="button" aria-label="关闭明细"><svg width="10" height="10" viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.2"><line x1="1" y1="1" x2="9" y2="9"/><line x1="9" y1="1" x2="1" y2="9"/></svg></button></div>';
   h += '<div class="seg-ctl" role="tablist">' +
     [["all", "全部"], ["ok", "● 符合清理规则"], ["review", "◐ 需复核"], ["keep", "○ 建议保留"]].map(function(x) {
-      return '<button role="tab" type="button" data-f="' + x[0] + '" class="' + (dState.filter === x[0] ? "on" : "") + '" aria-selected="' + (dState.filter === x[0]) + '"><span>' + x[1] + '</span> <span class="tabcount">' + cnt[x[0]] + "</span></button>";
+      return '<button role="tab" type="button" data-f="' + x[0] + '" class="' + (dState.filter === x[0] ? "on" : "") + '" aria-selected="' + (dState.filter === x[0]) + '"><span>' + x[1] + '</span> <span class="tabcount">' + esc(hasOwn(cnt, x[0]) ? cnt[x[0]] : 0) + "</span></button>";
     }).join("") +
     "</div>";
   if (allGroupCats) {
     var allOn = curSub === "other";
     h += '<div class="subcat-bar" id="drawerSubcats" role="group" aria-label="子分类筛选">' +
-      '<button type="button" class="subcat-pill' + (allOn ? " on" : "") + '" data-subcat="other" aria-pressed="' + allOn + '"><span>全部</span><span class="subcat-sz">' + fs(gv(g).total) + "</span></button>" +
+      '<button type="button" class="subcat-pill' + (allOn ? " on" : "") + '" data-subcat="other" aria-pressed="' + allOn + '"><span>全部</span><span class="subcat-sz">' + esc(fs(gv(g).total)) + "</span></button>" +
       allGroupCats.map(function(sc) {
         var on = curSub === sc.id;
-        var rem = Math.max(0, sc.total - (S.moved[sc.id] || 0));
-        return '<button type="button" class="subcat-pill' + (on ? " on" : "") + '" data-subcat="' + esc(sc.id) + '" aria-pressed="' + on + '"><span>' + esc(sc.name) + '</span><span class="subcat-sz">' + fs(rem) + "</span></button>";
+        var rem = Math.max(0, sc.total - (hasOwn(S.moved, sc.id) ? (Number(S.moved[sc.id]) || 0) : 0));
+        return '<button type="button" class="subcat-pill' + (on ? " on" : "") + '" data-subcat="' + esc(sc.id) + '" aria-pressed="' + on + '"><span>' + esc(sc.name) + '</span><span class="subcat-sz">' + esc(fs(rem)) + "</span></button>";
       }).join("") +
       "</div>";
   }
   h += '<div class="sortbar">排序：<button class="tlink ' + (dState.sort === "size" ? "on" : "") + '" type="button" data-s="size">按大小</button><button class="tlink ' + (dState.sort === "name" ? "on" : "") + '" type="button" data-s="name">按名称</button></div><div class="flist" id="flist">';
   if (nativeDetail()) {
-    h += '<div class="sortbar" style="display:flex;align-items:center;justify-content:space-between;gap:8px"><button class="tlink" type="button" id="pagePrev" ' + (!page || page.offset === 0 ? "disabled" : "") + '>上一页</button><span role="status">' + (page ? (page.total ? (page.offset + 1) + "–" + Math.min(page.offset + page.limit, page.total) + " / " + page.total : "0 / 0") : "正在加载…") + '</span><button class="tlink" type="button" id="pageNext" ' + (!page || page.offset + page.limit >= page.total ? "disabled" : "") + ">下一页</button></div>";
+    var pgOff = page ? Math.max(0, safeInt(page.offset)) : 0;
+    var pgLim = page ? Math.max(0, safeInt(page.limit)) : 0;
+    var pgTot = page ? Math.max(0, safeInt(page.total)) : 0;
+    h += '<div class="sortbar pagebar"><button class="tlink" type="button" id="pagePrev" ' + (!page || pgOff === 0 ? "disabled" : "") + '>上一页</button><span role="status">' + (page ? (pgTot ? (pgOff + 1) + "–" + Math.min(pgOff + pgLim, pgTot) + " / " + pgTot : "0 / 0") : "正在加载…") + '</span><button class="tlink" type="button" id="pageNext" ' + (!page || pgOff + pgLim >= pgTot ? "disabled" : "") + ">下一页</button></div>";
   }
   var any = false;
   cats.forEach(function(c) {
@@ -1651,19 +1693,22 @@ function baseDrawerRender() {
     if (!fl.length) return;
     any = true;
     fl = fl.slice().sort(dState.sort === "size" ? function(a, b) { return b.s - a.s; } : function(a, b) { return a.n.localeCompare(b.n, "zh"); });
-    if (cats.length > 1) h += '<div class="sect"><span>' + esc(c.name) + "</span><span>" + fs(c.total) + "</span></div>";
+    if (cats.length > 1) h += '<div class="sect"><span>' + esc(c.name) + "</span><span>" + esc(fs(c.total)) + "</span></div>";
     fl.forEach(function(f) {
       f.x = f.x || {};
       var key = f.id != null ? "id|" + f.id : c.id + "|" + f.n, detail = fileInfo(f);
       var fsub = fileSubLine(detail, true);
-      h += '<div class="file" data-k="' + esc(key) + '"><button class="fhead" type="button" aria-label="' + esc(JL[f.j] + "，" + f.n + "，" + fsub + "，" + fs(f.s)) + '"><span class="gl">' + G[f.j] + '</span><span class="mid"><span class="fname">' + esc(f.n) + '</span><span class="ftype" title="' + esc(fsub) + '">' + esc(fsub) + '</span><span class="fdir">' + esc(midDir(f.p)) + '</span></span><span class="fsz">' + (f.x.sizeComplete === false ? "≥ " : "") + fs(f.s) + '</span><span class="chev">›</span></button></div>';
+      h += '<div class="file" data-k="' + esc(key) + '"><button class="fhead" type="button" aria-label="' + esc(judgeLabel(f.j) + "，" + f.n + "，" + fsub + "，" + fs(f.s)) + '"><span class="gl">' + esc(judgeGlyph(f.j)) + '</span><span class="mid"><span class="fname">' + esc(f.n) + '</span><span class="ftype" title="' + esc(fsub) + '">' + esc(fsub) + '</span><span class="fdir">' + esc(midDir(f.p)) + '</span></span><span class="fsz">' + (f.x.sizeComplete === false ? "≥ " : "") + esc(fs(f.s)) + '</span><span class="chev">›</span></button></div>';
     });
     if (!nativeDetail() && c.count > c.files.length) {
-      h += '<div class="dfoot" style="border:0"><span>仅列出最大的 ' + fl.length + " 个，共 " + c.count.toLocaleString("en-US") + " 个</span><span>按大小排序</span></div>";
+      h += '<div class="dfoot dfoot-plain"><span>仅列出最大的 ' + fl.length + " 个，共 " + esc(fmtCount(safeInt(c.count))) + " 个</span><span>按大小排序</span></div>";
     }
   });
   if (!any) {
-    h += '<p class="sub" style="padding:24px 0;text-align:center">' + (dState.loading ? "正在加载明细…" : "这一类里没有「" + JL[dState.filter] + "」的文件。") + "</p>";
+    var emptyMsg = dState.loading
+      ? "正在加载明细…"
+      : (dState.filter === "all" ? "这一类里没有符合条件的文件。" : "这一类里没有「" + esc(judgeLabel(dState.filter)) + "」的文件。");
+    h += '<p class="sub flist-empty">' + emptyMsg + "</p>";
   }
   h += '</div><div class="dfoot"><span>可查看、复制路径、定位文件。</span><span>Esc 关闭</span></div>';
 
@@ -1673,7 +1718,7 @@ function baseDrawerRender() {
     next.innerHTML = h;
     drawer.querySelector(".dtot").textContent = next.querySelector(".dtot").textContent;
     drawer.querySelectorAll("[data-f]").forEach(function(b) {
-      var count = b.querySelector(".tabcount"), text = String(cnt[b.dataset.f]);
+      var count = b.querySelector(".tabcount"), text = String(hasOwn(cnt, b.dataset.f) ? cnt[b.dataset.f] : 0);
       if (count.textContent !== text) count.textContent = text;
     });
     $("flist").replaceWith(next.querySelector("#flist"));
@@ -1684,20 +1729,20 @@ function baseDrawerRender() {
   syncDrawerTabs();
   drawer.querySelector(".close").onclick = closeDrawer;
   drawer.querySelectorAll("[data-f]").forEach(function(b) {
-    b.onclick = function() { dState.filter = b.dataset.f; dState.open = {}; loadDrawerPage(0); };
+    b.onclick = function() { dState.filter = b.dataset.f; dState.open = Object.create(null); loadDrawerPage(0); };
   });
   drawer.querySelectorAll("[data-subcat]").forEach(function(b) {
     b.onclick = function() {
       var nextSub = b.dataset.subcat || "other";
       if ((dState.catId || "other") === nextSub) return;
       dState.catId = nextSub;
-      dState.open = {};
+      dState.open = Object.create(null);
       dState.listShell = false;
       loadDrawerPage(0);
     };
   });
   drawer.querySelectorAll("[data-s]").forEach(function(b) {
-    b.onclick = function() { dState.sort = b.dataset.s; dState.open = {}; loadDrawerPage(0); };
+    b.onclick = function() { dState.sort = b.dataset.s; dState.open = Object.create(null); loadDrawerPage(0); };
   });
   var prev = drawer.querySelector("#pagePrev"), nextBtn = drawer.querySelector("#pageNext");
   if (prev) prev.onclick = function() { loadDrawerPage(Math.max(0, page.offset - page.limit)); };
@@ -1769,7 +1814,7 @@ function drawRender() {
   updateModals();
   setTimeout(function() {
     if (drawerOpen && overlay === "drawer" && !dState.detailKey) {
-      var f = dState.focusToken && drawer.querySelector(dState.focusToken);
+      var f = dState.focusToken && safeQuery(drawer, dState.focusToken);
       if (!f || f.disabled || (f.closest && f.closest("[inert],[hidden]"))) f = drawer.querySelector(".fhead,.close");
       if (f) f.focus({ preventScroll: true });
     }
@@ -1865,11 +1910,11 @@ function fallbackCopy(t) {
 })();
 
 /* ================= sound (application only, first launch off; remember user choice) ================= */
-var soundOn = false, currentScanSession = null, audioWarned = {};
+var soundOn = false, currentScanSession = null, audioWarned = Object.create(null);
 try { soundOn = localStorage.getItem("anping.sound.enabled") === "true"; } catch (_) {}
 var audio = new AnPingAudio.Controller({
   onResult: function(r) {
-    if (/failed|timeout|unavailable/.test(r.status) && !audioWarned[r.status]) {
+    if (/failed|timeout|unavailable/.test(r.status) && !Object.prototype.hasOwnProperty.call(audioWarned, r.status)) {
       audioWarned[r.status] = true;
       soundState();
       toast("应用提示音未能播放（" + r.status + "）；未更改系统声音设置。");
@@ -1893,7 +1938,7 @@ function soundState() {
 if ($("soundBtn")) {
   $("soundBtn").onclick = function() {
     soundOn = !soundOn;
-    audioWarned = {};
+    audioWarned = Object.create(null);
     audio.setEnabled(soundOn);
     soundState();
     try { localStorage.setItem("anping.sound.enabled", String(soundOn)); }
@@ -1924,10 +1969,10 @@ var reviewMarks = Object.create(null), pendingLegend = false;
 function focusToken() {
   var a = document.activeElement;
   if (!a || !drawer.contains || !drawer.contains(a)) return "";
-  if (a.id) return "#" + a.id;
-  if (a.dataset && a.dataset.subcat) return '[data-subcat="' + a.dataset.subcat + '"]';
-  if (a.dataset && a.dataset.f) return '[data-f="' + a.dataset.f + '"]';
-  if (a.dataset && a.dataset.s) return '[data-s="' + a.dataset.s + '"]';
+  if (a.id) return "#" + cssEsc(a.id);
+  if (a.dataset && a.dataset.subcat) return '[data-subcat="' + cssAttrVal(a.dataset.subcat) + '"]';
+  if (a.dataset && a.dataset.f) return '[data-f="' + cssAttrVal(a.dataset.f) + '"]';
+  if (a.dataset && a.dataset.s) return '[data-s="' + cssAttrVal(a.dataset.s) + '"]';
   return ".fhead";
 }
 function maybeLegend() {
@@ -1937,8 +1982,8 @@ function maybeLegend() {
   }
 }
 function reviewCount() {
-  var n = { pending: 0, seen: 0, keep: 0 };
-  Object.keys(reviewMarks).forEach(function(k) { n[reviewMarks[k]]++; });
+  var n = Object.assign(Object.create(null), { pending: 0, seen: 0, keep: 0 });
+  Object.keys(reviewMarks).forEach(function(k) { var v = reviewMarks[k]; if (hasOwn(n, v)) n[v]++; });
   return "本次会话标记：已看 " + n.seen + " · 保留 " + n.keep + "（不改变系统判断/许可，关闭程序后不保存）";
 }
 function requestGroups(offset) {
@@ -1961,9 +2006,13 @@ function renderReviewGroup(g, i) {
   return '<button class="review-group" type="button" data-group="' + i + '"><b>' + esc(reviewFolderTitle(g.folder)) + '</b><span class="review-meta">' + fmtCount(g.count) + " 个文件 · " + fs(g.bytes / 1073741824) + " 逻辑大小" + (g.incomplete ? "（部分大小未知）" : "") + '</span><span class="review-conclusion">先保留，确认用途后再决定。当前证据不足以判为「符合清理规则」。</span><span class="review-reason">复核原因：' + esc(drawerText(g.reason || "用途与来源尚未确认")) + '</span><small class="review-path">位置：' + esc(g.folder || "未知") + "</small><small>打开查看全部文件、具体依据与处理后果 →</small></button>";
 }
 function drawReviewGroups(m) {
-  var list = m.groups || [];
+  var list = Array.isArray(m && m.groups) ? m.groups : [];
+  var mCount = Math.max(0, safeInt(m && m.count));
+  var mOffset = Math.max(0, safeInt(m && m.offset));
+  var mLimit = Math.max(1, safeInt(m && m.limit) || 30);
+  var mTotalGroups = Math.max(0, safeInt(m && m.totalGroups));
   // pi-lens-ignore: no-inner-html-js
-  drawer.innerHTML = '<div class="dhead"><h2>需复核 · 分组</h2><button class="close" type="button" aria-label="关闭复核抽屉">×</button></div><p class="sub">按文件夹与现有复核原因分组，不以来源、大小或抽样证明安全。' + (m.count || 0) + " 个文件 · " + fs((m.bytes || 0) / 1073741824) + ' 逻辑大小</p><p class="sub">' + reviewCount() + '</p><div class="flist">' + (m.error ? '<p role="alert">' + esc(m.error) + "</p>" : "") + list.map(renderReviewGroup).join("") + (list.length ? "" : '<p class="sub">没有需复核分组。</p>') + '</div><div class="dfoot"><button class="tlink" type="button" id="groupPrev" ' + (!m.offset ? "disabled" : "") + ">上页组</button><span>" + ((m.offset || 0) + 1) + " / " + (m.totalGroups || 0) + ' 组</span><button class="tlink" type="button" id="groupNext" ' + ((m.offset || 0) + (m.limit || 30) >= (m.totalGroups || 0) ? "disabled" : "") + ">下页组</button></div>";
+  drawer.innerHTML = '<div class="dhead"><h2>需复核 · 分组</h2><button class="close" type="button" aria-label="关闭复核抽屉">×</button></div><p class="sub">按文件夹与现有复核原因分组，不以来源、大小或抽样证明安全。' + mCount + " 个文件 · " + esc(fs((Number(m && m.bytes) || 0) / 1073741824)) + ' 逻辑大小</p><p class="sub">' + esc(reviewCount()) + '</p><div class="flist">' + (m && m.error ? '<p role="alert">' + esc(m.error) + "</p>" : "") + list.map(renderReviewGroup).join("") + (list.length ? "" : '<p class="sub">没有需复核分组。</p>') + '</div><div class="dfoot"><button class="tlink" type="button" id="groupPrev" ' + (!mOffset ? "disabled" : "") + ">上页组</button><span>" + (mOffset + 1) + " / " + mTotalGroups + ' 组</span><button class="tlink" type="button" id="groupNext" ' + (mOffset + mLimit >= mTotalGroups ? "disabled" : "") + ">下页组</button></div>";
   drawer.querySelector(".close").onclick = closeDrawer;
   drawer.querySelectorAll("[data-group]").forEach(function(b) {
     b.onclick = function() {
@@ -1990,7 +2039,7 @@ function validFocus(el) {
   return el && document.body.contains && document.body.contains(el) && !el.disabled && !(el.closest && el.closest("[inert],[hidden]")) && (!el.getClientRects || el.getClientRects().length);
 }
 function returnFocus() {
-  var el = validFocus(modalFocus) ? modalFocus : (modalReturn && document.querySelector(modalReturn));
+  var el = validFocus(modalFocus) ? modalFocus : (modalReturn && safeQuery(document, modalReturn));
   if (!validFocus(el)) el = document.querySelector("#allFiles,#quickScanBtn,#pick,#firstChatScanBtn,#snapshotFiles") || $("soundBtn");
   if (validFocus(el)) el.focus({ preventScroll: true });
   modalFocus = null;
@@ -2003,7 +2052,7 @@ function updateModals() {
   var top = dlgShown ? dlg : (legend.classList.contains("show") ? legend : (overlay === "sheet" ? sheet : (drawerOpen ? drawer : null)));
   if (top && top !== modalTop) {
     modalFocus = lastFocus && document.body.contains && document.body.contains(lastFocus) ? lastFocus : document.activeElement;
-    modalReturn = modalFocus && modalFocus.id ? "#" + modalFocus.id : "";
+    modalReturn = modalFocus && modalFocus.id ? "#" + cssEsc(modalFocus.id) : "";
   }
   var changed = modalTop !== top;
   modalTop = top;
@@ -2111,7 +2160,7 @@ document.addEventListener("keydown", function(e) {
     items[n].click();
     setTimeout(function() {
       var role = a.getAttribute("role"), attribute = role === "tab" ? "data-f" : "data-i", value = items[n].getAttribute(attribute);
-      var live = top && top.querySelector('[' + attribute + '="' + value + '"]');
+      var live = top && value != null && safeQuery(top, '[' + attribute + '="' + cssAttrVal(value) + '"]');
       if (live) live.focus({ preventScroll: true });
     }, 0);
   }
@@ -2269,24 +2318,33 @@ function renderDirectory() {
   // pi-lens-ignore: no-inner-html-js
   $("directorySource").innerHTML = "<span>" + esc(p.source) + '</span><span class="dir-leg-items" aria-label="图例"><span class="dir-leg-item"><i class="dir-sw ok" aria-hidden="true"></i>符合清理规则</span><span class="dir-leg-item"><i class="dir-sw review" aria-hidden="true"></i>需复核</span><span class="dir-leg-item"><i class="dir-sw keep" aria-hidden="true"></i>建议保留</span></span>';
   $("directoryCrumbs").title = p.currentPath || "";
+  var crumbs = Array.isArray(p.breadcrumb) ? p.breadcrumb : [];
+  var dirId = safeInt(p.directoryId);
   // pi-lens-ignore: no-inner-html-js
-  $("directoryCrumbs").innerHTML = p.breadcrumb.map(function(b) {
-    return '<button class="tlink" type="button" data-dir="' + b.id + '"' + (b.id === p.directoryId ? ' aria-current="location"' : "") + ' title="' + esc(b.path || b.name) + '">' + esc(b.name) + "</button>";
+  $("directoryCrumbs").innerHTML = crumbs.map(function(b) {
+    var bid = safeInt(b.id);
+    return '<button class="tlink" type="button" data-dir="' + bid + '"' + (bid === dirId ? ' aria-current="location"' : "") + ' title="' + esc(b.path || b.name) + '">' + esc(b.name) + "</button>";
   }).join('<span aria-hidden="true"> › </span>');
-  if ($("directoryHead")) $("directoryHead").hidden = !p.rows.length;
+  var dirRows = Array.isArray(p.rows) ? p.rows : [];
+  if ($("directoryHead")) $("directoryHead").hidden = !dirRows.length;
   // pi-lens-ignore: no-inner-html-js
-  $("directoryRows").innerHTML = p.rows.map(function(r, i) {
-    var pct = p.totalBytes ? 100 * r.bytes / p.totalBytes : 0;
-    var eb = typeof r.eligibleBytes === "number" ? r.eligibleBytes : 0;
-    var rb = typeof r.reviewBytes === "number" ? r.reviewBytes : 0;
-    var kb = typeof r.keepBytes === "number" ? r.keepBytes : 0;
+  $("directoryRows").innerHTML = dirRows.map(function(r, i) {
+    var pct = p.totalBytes ? 100 * (Number(r.bytes) || 0) / p.totalBytes : 0;
+    var eb = typeof r.eligibleBytes === "number" ? Math.max(0, r.eligibleBytes) : 0;
+    var rb = typeof r.reviewBytes === "number" ? Math.max(0, r.reviewBytes) : 0;
+    var kb = typeof r.keepBytes === "number" ? Math.max(0, r.keepBytes) : 0;
     var btot = eb + rb + kb;
-    var ep = btot > 0 ? eb / btot * 100 : 0, rp = btot > 0 ? rb / btot * 100 : 0, kp = btot > 0 ? Math.max(0, 100 - ep - rp) : 0;
+    var ep = btot > 0 ? Math.min(100, Math.max(0, eb / btot * 100)) : 0;
+    var rp = btot > 0 ? Math.min(100, Math.max(0, rb / btot * 100)) : 0;
+    var kp = btot > 0 ? Math.min(100, Math.max(0, 100 - ep - rp)) : 0;
     var barAria = (eb > 0 ? "符合清理规则 " + fs(eb / 1073741824) + " " : "") +
       (rb > 0 ? "需复核 " + fs(rb / 1073741824) + " " : "") +
       (kb > 0 ? "建议保留 " + fs(kb / 1073741824) : "");
-    return '<div class="directory-row"><button class="directory-name" type="button" data-row="' + i + '" aria-label="' + esc(r.name + (r.isDirectory ? "，进入目录" : "，查看文件")) + '"><span class="' + (r.isDirectory ? "fi-dir" : "fi-file") + '" aria-hidden="true"></span><span>' + esc(r.name) + '</span></button><span class="directory-size">' + (r.sizeComplete ? "" : "≥ ") + fs(r.bytes / 1073741824) + '<span class="pct">· ' + pct.toFixed(1) + '%</span></span><span class="directory-count">' + fmtCount(r.fileCount) + ' 个</span><span class="dir-bars" role="img" aria-label="' + esc(barAria.trim() || "0 B") + '"><i class="ok" style="width:' + ep.toFixed(2) + '%"></i><i class="review" style="width:' + rp.toFixed(2) + '%"></i><i class="keep" style="width:' + kp.toFixed(2) + '%"></i></span></div>';
-  }).join("") || '<p class="sub" style="padding:14px 0">这里没有符合清理规则的文件；未进入的目录和空目录不在此列。</p>';
+    return '<div class="directory-row"><button class="directory-name" type="button" data-row="' + i + '" aria-label="' + esc(r.name + (r.isDirectory ? "，进入目录" : "，查看文件")) + '"><span class="' + (r.isDirectory ? "fi-dir" : "fi-file") + '" aria-hidden="true"></span><span>' + esc(r.name) + '</span></button><span class="directory-size">' + (r.sizeComplete ? "" : "≥ ") + esc(fs((Number(r.bytes) || 0) / 1073741824)) + '<span class="pct">· ' + pct.toFixed(1) + '%</span></span><span class="directory-count">' + esc(fmtCount(safeInt(r.fileCount))) + ' 个</span><span class="dir-bars" role="img" aria-label="' + esc(barAria.trim() || "0 B") + '"><i class="ok" data-w="' + ep.toFixed(2) + '"></i><i class="review" data-w="' + rp.toFixed(2) + '"></i><i class="keep" data-w="' + kp.toFixed(2) + '"></i></span></div>';
+  }).join("") || '<p class="sub dir-empty">这里没有符合清理规则的文件；未进入的目录和空目录不在此列。</p>';
+  $("directoryRows").querySelectorAll(".dir-bars i[data-w]").forEach(function(barSeg) {
+    barSeg.style.width = barSeg.dataset.w + "%";
+  });
   $("directoryPrev").disabled = p.pageOffset === 0;
   $("directoryNext").disabled = p.pageOffset + p.pageLimit >= p.totalRows;
   $("directoryPage").textContent = p.totalRows ? (p.pageOffset + 1) + "–" + Math.min(p.totalRows, p.pageOffset + p.pageLimit) + " / " + p.totalRows : "0 / 0";
@@ -2372,11 +2430,11 @@ function renderLargeFiles() {
     $("largeFilesRows").innerHTML = files.map(function(f, i) {
       var detail = fileInfo(f);
       var subLine = fileSubLine(detail, false);
-      return '<button type="button" class="directory-row large-file-row" data-lf="' + i + '" aria-label="' + esc(f.n + "，" + subLine + "，" + JL[f.j] + "，" + fs(f.s) + "，查看文件详情") + '">' +
+      return '<button type="button" class="directory-row large-file-row" data-lf="' + i + '" aria-label="' + esc(f.n + "，" + subLine + "，" + judgeLabel(f.j) + "，" + fs(f.s) + "，查看文件详情") + '">' +
         '<span class="lf-name"><span class="fi-file" aria-hidden="true"></span><span class="lf-name-body"><span class="lf-fn">' + esc(f.n) + '</span><span class="lf-sub" title="' + esc(subLine) + '">' + esc(subLine) + '</span></span></span>' +
-        '<span class="lf-judge' + (f.j === "keep" ? " keep" : "") + '"><span class="g">' + G[f.j] + "</span> " + JL[f.j] + "</span>" +
+        '<span class="lf-judge' + (f.j === "keep" ? " keep" : "") + '"><span class="g">' + esc(judgeGlyph(f.j)) + "</span> " + esc(judgeLabel(f.j)) + "</span>" +
         '<span class="lf-loc" title="' + esc(f.p) + '">' + esc(midDir(f.p)) + "</span>" +
-        '<span class="directory-size">' + (f.x.sizeComplete === false ? "≥ " : "") + fs(f.s) + "</span></button>";
+        '<span class="directory-size">' + (f.x.sizeComplete === false ? "≥ " : "") + esc(fs(f.s)) + "</span></button>";
     }).join("");
   } else if (isChat) {
     // pi-lens-ignore: no-inner-html-js
@@ -2399,7 +2457,7 @@ function renderLargeFiles() {
       "</div></div>";
   } else {
     // pi-lens-ignore: no-inner-html-js
-    $("largeFilesRows").innerHTML = '<p class="sub" style="padding:14px 0">这里没有已分析的文件。</p>';
+    $("largeFilesRows").innerHTML = '<p class="sub dir-empty">这里没有已分析的文件。</p>';
   }
 
   $("largeFilesRows").querySelectorAll("[data-lf]").forEach(function(b) {
@@ -2423,7 +2481,7 @@ function openDirectoryFile(file, backLabel) {
     g: null,
     filter: "all",
     sort: "size",
-    open: {},
+    open: Object.create(null),
     page: { files: [file], offset: 0, total: 1 }
   };
   drawerOpen = true;
@@ -2456,15 +2514,15 @@ if ($("directoryMoreBtn")) {
 
 /* ================= category adoption (shared with bridge & recycle) ================= */
 function adoptCategories(list) {
-  CATS = list || [];
+  CATS = Array.isArray(list) ? list : [];
   if (CATS.length === 0) {
-    S.found = {}; S.moved = {}; S.failed = {}; S.selected = {};
+    S.found = Object.create(null); S.moved = Object.create(null); S.failed = Object.create(null); S.selected = Object.create(null);
   }
   CATS.forEach(function(c) {
     S.found[c.id] = 1;
-    if (S.moved[c.id] === undefined) S.moved[c.id] = 0;
-    if (S.failed[c.id] === undefined) S.failed[c.id] = 0;
-    if (S.selected[c.id] === undefined) S.selected[c.id] = c.ok > 0;
+    if (!hasOwn(S.moved, c.id)) S.moved[c.id] = 0;
+    if (!hasOwn(S.failed, c.id)) S.failed[c.id] = 0;
+    if (!hasOwn(S.selected, c.id)) S.selected[c.id] = c.ok > 0;
     c.files = (c.files || []).map(function(f) { f.x = f.x || {}; return f; });
   });
   var positions = slots.filter(function(sl) { return sl.g; }).map(function(sl) {
@@ -2569,17 +2627,18 @@ fit();
   }
 
   window.chrome.webview.addEventListener("message", function(event) {
-    var msg = event.data;
+    var msg = event && event.data;
     if (typeof msg === "string") {
       try { msg = JSON.parse(msg); } catch (e) { return; }
     }
-    if (!msg || !msg.action) return;
+    if (!msg || typeof msg !== "object" || Array.isArray(msg) || typeof msg.action !== "string" || !msg.action) return;
 
     if (msg.action === "scanStarted") {
+      if (typeof msg.scanSessionId !== "number" || !Number.isFinite(msg.scanSessionId)) return;
       currentScanSession = msg.scanSessionId;
       audio.beginSession(currentScanSession);
-    } else if (/^scan(Progress|Complete|Paused|Stopping|Continued)$/.test(msg.action) && msg.scanSessionId != null && msg.scanSessionId !== currentScanSession) {
-      return;
+    } else if (/^scan(Progress|Complete|Paused|Stopping|Continued)$/.test(msg.action)) {
+      if (typeof msg.scanSessionId !== "number" || msg.scanSessionId !== currentScanSession) return;
     }
 
     switch (msg.action) {
@@ -2612,17 +2671,16 @@ fit();
         break;
 
       case "drivesList":
-        window.NATIVE_DRIVES = msg.drives || [];
-        window.NATIVE_CHAT_FOLDERS = Array.isArray(msg.chatFolders) ? msg.chatFolders : [];
+        nativeDrives = Array.isArray(msg.drives) ? msg.drives : [];
+        nativeChatFolders = Array.isArray(msg.chatFolders) ? msg.chatFolders : [];
         if (REFRESH_PICKER && overlay === "sheet") REFRESH_PICKER();
         break;
 
       case "folderAdded":
-        if (msg.folder) {
-          window.NATIVE_DRIVES = window.NATIVE_DRIVES || [];
-          window.NATIVE_DRIVES.forEach(function(d) { d.selected = false; });
+        if (msg.folder && typeof msg.folder === "object" && !Array.isArray(msg.folder)) {
+          nativeDrives.forEach(function(d) { d.selected = false; });
           msg.folder.selected = true;
-          window.NATIVE_DRIVES.push(msg.folder);
+          nativeDrives.push(msg.folder);
           pickerMode = "drive";
           if (REFRESH_PICKER && overlay === "sheet") REFRESH_PICKER();
         }
@@ -2701,7 +2759,7 @@ fit();
       case "fileActionResult":
         if (!msg.success) { toast(msg.error || "文件操作失败"); break; }
         if (msg.op === "copy") {
-          var copyBtn = drawer.querySelector('[data-k="id|' + msg.id + '"] [data-a="copy"]');
+          var copyBtn = safeQuery(drawer, '[data-k="id|' + cssAttrVal(msg.id) + '"] [data-a="copy"]');
           if (copyBtn) {
             copyBtn.textContent = "已复制完整路径";
             setTimeout(function() { copyBtn.textContent = "复制路径"; }, 1500);
@@ -2821,13 +2879,21 @@ fit();
         S.cleanProg = { done: msg.done, total: msg.total };
         if (typeof msg.deleted === "number" || typeof msg.deletedBytes === "number" || msg.currentPath || msg.deletedByCat) {
           S.cleanDetail = { deleted: msg.deleted || 0, deletedBytes: msg.deletedBytes || 0, currentPath: msg.currentPath || "" };
-          if (msg.deletedByCat) S.cleanByCat = msg.deletedByCat;
+          if (msg.deletedByCat && typeof msg.deletedByCat === "object" && !Array.isArray(msg.deletedByCat)) {
+            var byCat = Object.create(null);
+            Object.keys(msg.deletedByCat).forEach(function(k) {
+              var v = Number(msg.deletedByCat[k]);
+              if (Number.isFinite(v) && v >= 0) byCat[k] = v;
+            });
+            S.cleanByCat = byCat;
+          }
         }
         render();
         break;
 
       case "cleanResult":
         if (msg.request !== S.cleanRequest) break;
+        if (msg.scanSessionId != null && currentScanSession != null && msg.scanSessionId !== currentScanSession) break;
         S.cleanRequest = null; S.cleaning = false; S.cleanStopping = false; S.cleanProg = null;
         S.cleanMaxT = 0; S.cleanByCat = null; S.cleanDetail = null;
         if (msg.locked) S.cleanLocked = true;
@@ -2872,8 +2938,13 @@ fit();
         S.cleanLocked = true;
         render();
         showCleanProblems(
-          { problems: (msg.items || []).map(function(i) { return { name: i.name, detail: i.exists ? "文件仍在原处" : "文件已不在原处（可能已删除）" }; }) },
-          "上次清理在 " + msg.count + " 个文件上中断（程序被关闭或崩溃），无法确定这些文件是否已被删除。请重新扫描核对。详细记录：" + msg.log,
+          {
+            problems: (Array.isArray(msg.items) ? msg.items : []).map(function(i) {
+              var item = i && typeof i === "object" ? i : {};
+              return { name: item.name || "", detail: item.exists ? "文件仍在原处" : "文件已不在原处（可能已删除）" };
+            })
+          },
+          "上次清理在 " + safeInt(msg.count) + " 个文件上中断（程序被关闭或崩溃），无法确定这些文件是否已被删除。请重新扫描核对。详细记录：" + (msg.log || ""),
           "上次清理未完成"
         );
         break;

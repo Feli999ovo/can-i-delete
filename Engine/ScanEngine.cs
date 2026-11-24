@@ -242,11 +242,33 @@ public sealed class ScanCoverage
 // 广度优先流式遍历；不跟链接。保留队列/当前目录，暂停不会重新开始或丢失条目。
 public sealed class RecursiveFileEnumerator : IFileEnumerator
 {
+    private const int MaxPendingDirectoriesCap = 200000;
+
+    private sealed class FileIdentityComparer : IEqualityComparer<FileIdentity>
+    {
+        public bool Equals(FileIdentity x, FileIdentity y)
+        {
+            return x.SameAs(y);
+        }
+
+        public int GetHashCode(FileIdentity obj)
+        {
+            unchecked
+            {
+                int h = (int)obj.VolumeSerial;
+                h = (h * 397) ^ (int)obj.IndexHigh;
+                h = (h * 397) ^ (int)obj.IndexLow;
+                return h;
+            }
+        }
+    }
+
     readonly object gate = new object();
     readonly Queue<string> pending = new Queue<string>();
     readonly List<string> skipped = new List<string>();
     readonly List<string> priorities = new List<string>();
     readonly HashSet<string> scheduled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<FileIdentity> visitedIds = new HashSet<FileIdentity>(new FileIdentityComparer());
     string root = "", active = "";
     int started, completed, denied, links, metadata;
     bool closed;
@@ -279,8 +301,8 @@ public sealed class RecursiveFileEnumerator : IFileEnumerator
         {
             for (int i = 0; i < directories.Count; i++)
             {
-                string d = directories[i];
-                if (!string.IsNullOrEmpty(d) && rootSet.Add(d)) targetRoots.Add(d);
+                string d = PathGuard.Canonical(directories[i]);
+                if (d.Length > 0 && PathGuard.IsLocalDrivePath(d) && rootSet.Add(d)) targetRoots.Add(d);
             }
         }
         bool singleRoot = (targetRoots.Count == 1);
@@ -292,31 +314,32 @@ public sealed class RecursiveFileEnumerator : IFileEnumerator
                 : (singleRoot ? targetRoots[0] : (targetRoots[0] + " 等 " + targetRoots.Count + " 个位置"));
         }
 
-        // 先覆盖已有规则的缓存根，避免深层缓存排在海量目录之后；逐级拒绝重解析祖先。
+        // 先覆盖已有规则的缓存根，避免深层缓存排在海量目录之后；全链路拒绝重解析点。
         string[] knownCacheDirs = CacheRoots.ScanDirectories();
         for (int rIdx = 0; rIdx < targetRoots.Count; rIdx++)
         {
             string directory = targetRoots[rIdx];
             foreach (string candidate in knownCacheDirs)
             {
-                if (!PathGuard.IsInside(directory, candidate)) continue;
-                string current = directory;
-                bool safe = true;
-                string rest = candidate.Substring(directory.TrimEnd('\\').Length).Trim('\\');
-                try
+                string canonCandidate = PathGuard.Canonical(candidate);
+                if (canonCandidate.Length == 0 || !PathGuard.IsLocalDrivePath(canonCandidate)) continue;
+                if (!PathGuard.IsInside(directory, canonCandidate)) continue;
+                if (!Directory.Exists(canonCandidate)) continue;
+                if (PathGuard.HasAnyReparseComponent(canonCandidate)) continue;
+                lock (gate)
                 {
-                    if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0) safe = false;
-                    foreach (string part in rest.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
+                    if (pending.Count < MaxPendingDirectoriesCap && scheduled.Add(canonCandidate))
                     {
-                        if (!safe) break;
-                        current = Path.Combine(current, part);
-                        if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) safe = false;
+                        pending.Enqueue(canonCandidate);
+                        priorities.Add(canonCandidate);
                     }
                 }
-                catch { safe = false; }
-                if (safe) lock (gate) { if (scheduled.Add(candidate)) { pending.Enqueue(candidate); priorities.Add(candidate); } }
             }
-            lock (gate) { if (scheduled.Add(directory)) pending.Enqueue(directory); }
+            lock (gate)
+            {
+                if (pending.Count < MaxPendingDirectoriesCap && scheduled.Add(directory))
+                    pending.Enqueue(directory);
+            }
         }
 
         int failedRoots = 0;
@@ -327,13 +350,52 @@ public sealed class RecursiveFileEnumerator : IFileEnumerator
                 string dir;
                 lock (gate) { if (pending.Count == 0) break; dir = pending.Dequeue(); active = dir; started++; }
                 bool isTopRoot = rootSet.Contains(dir);
+
+                bool dirExists = false;
+                bool dirDirectReparse = false;
+                try
+                {
+                    FileAttributes da = File.GetAttributes(dir);
+                    dirExists = true;
+                    if ((da & FileAttributes.ReparsePoint) != 0) dirDirectReparse = true;
+                }
+                catch (FileNotFoundException) { dirExists = false; }
+                catch (DirectoryNotFoundException) { dirExists = false; }
+                catch { dirExists = true; }
+
+                if (dirDirectReparse || (dirExists && (PathGuard.IsReparsePoint(dir) || PathGuard.HasAnyReparseComponent(dir))))
+                {
+                    lock (gate)
+                    {
+                        links++;
+                        if (skipped.Count < 64) skipped.Add(dir + " · 重解析点不跟随，其内部内容未覆盖");
+                        active = "";
+                    }
+                    continue;
+                }
+
+                if (dirExists)
+                {
+                    FileIdentity dirId = FileIdentityProbe.Capture(dir);
+                    if (dirId.Ok)
+                    {
+                        bool alreadyVisited;
+                        lock (gate) { alreadyVisited = !visitedIds.Add(dirId); }
+                        if (alreadyVisited)
+                        {
+                            lock (gate) { active = ""; }
+                            continue;
+                        }
+                    }
+                }
+
                 IEnumerator<FileSystemInfo> entries = null;
                 bool complete = false;
                 try { entries = new DirectoryInfo(dir).EnumerateFileSystemInfos().GetEnumerator(); }
                 catch (Exception ex)
                 {
                     Skip(dir, ex.Message, true);
-                    if (singleRoot && dir == singleRootPath) throw;
+                    if (singleRoot && String.Equals(dir, singleRootPath, StringComparison.OrdinalIgnoreCase)) throw;
                     if (isTopRoot)
                     {
                         failedRoots++;
@@ -351,7 +413,7 @@ public sealed class RecursiveFileEnumerator : IFileEnumerator
                             catch (Exception ex)
                             {
                                 Skip(dir, ex.Message, true);
-                                if (singleRoot && dir == singleRootPath) throw;
+                                if (singleRoot && String.Equals(dir, singleRootPath, StringComparison.OrdinalIgnoreCase)) throw;
                                 break;
                             }
                             if (!moved) { complete = true; break; }
@@ -369,7 +431,21 @@ public sealed class RecursiveFileEnumerator : IFileEnumerator
                             {
                                 lock (gate) { links++; if (skipped.Count < 64) skipped.Add(e.FullName + " · 重解析点不跟随，其内部内容未覆盖"); }
                             }
-                            else if (e.IsDirectory && e.MetadataError.Length == 0) { lock (gate) if (scheduled.Add(e.FullName)) pending.Enqueue(e.FullName); }
+                            else if (e.IsDirectory && e.MetadataError.Length == 0)
+                            {
+                                lock (gate)
+                                {
+                                    if (pending.Count < MaxPendingDirectoriesCap)
+                                    {
+                                        if (scheduled.Add(e.FullName)) pending.Enqueue(e.FullName);
+                                    }
+                                    else
+                                    {
+                                        denied++;
+                                        if (skipped.Count < 64) skipped.Add(e.FullName + " · 待扫描目录队列达到上限，已跳过");
+                                    }
+                                }
+                            }
                             yield return e;
                         }
                     }
@@ -386,7 +462,13 @@ public sealed class RealFileEnumerator : IFileEnumerator
 {
     public IEnumerable<FsEntry> Enumerate(string directory)
     {
-        DirectoryInfo di = new DirectoryInfo(directory);
+        string canon = PathGuard.Canonical(directory);
+        if (canon.Length == 0 || !PathGuard.IsLocalDrivePath(canon))
+            throw new IOException("扫描根目录路径无效");
+        if (PathGuard.IsReparsePoint(canon) || PathGuard.HasAnyReparseComponent(canon))
+            throw new IOException("扫描根目录或其上级包含符号链接或重解析点");
+
+        DirectoryInfo di = new DirectoryInfo(canon);
         // EnumerateFileSystemInfos 返回的实例已带上 FindFirstFile/FindNextFile 的快照
         // （属性 / 长度 / 时间），因此取这些字段不会再产生额外系统调用。
         foreach (FileSystemInfo fsi in di.EnumerateFileSystemInfos())
@@ -394,13 +476,21 @@ public sealed class RealFileEnumerator : IFileEnumerator
             FsEntry e = new FsEntry();
             e.FullName = fsi.FullName;
             e.Name = fsi.Name;
-            e.Attributes = fsi.Attributes;
-            e.IsDirectory = (fsi.Attributes & FileAttributes.Directory) != 0;
-            e.LastWriteUtc = fsi.LastWriteTimeUtc;
-            if (!e.IsDirectory)
+            e.IsDirectory = fsi is DirectoryInfo;
+            try
             {
-                FileInfo fi = fsi as FileInfo;
-                if (fi != null) e.Length = fi.Length;
+                e.Attributes = fsi.Attributes;
+                e.IsDirectory = (e.Attributes & FileAttributes.Directory) != 0;
+                e.LastWriteUtc = fsi.LastWriteTimeUtc;
+                if (!e.IsDirectory && !e.IsReparse)
+                {
+                    FileInfo fi = fsi as FileInfo;
+                    if (fi != null) e.Length = fi.Length;
+                }
+            }
+            catch (Exception ex)
+            {
+                e.MetadataError = "属性读取失败：" + ex.Message;
             }
             yield return e;
         }
@@ -520,7 +610,7 @@ public sealed class RealEntryAnalyzer : IEntryAnalyzer
             item.HasChildren = size.HasChildren;
         }
 
-        DateTime now = DateTime.Now;
+        DateTime now = DateTime.UtcNow;
         int days = (int)(now - e.LastWriteUtc).TotalDays;
         if (days < 0) days = 0;
         item.Days = days;

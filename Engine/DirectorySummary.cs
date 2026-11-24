@@ -32,9 +32,16 @@ public class DirectorySummary
     public DirectorySummary(string root)
     {
         multiRoot = false;
-        string norm = Normalize(root);
-        displayRoot = norm;
-        scanRoots.Add(norm);
+        string norm = TryNormalize(root);
+        if (norm.Length > 0)
+        {
+            displayRoot = norm;
+            scanRoots.Add(norm);
+        }
+        else
+        {
+            displayRoot = "";
+        }
     }
 
     public DirectorySummary(IList<string> roots, string displayRootName)
@@ -42,9 +49,16 @@ public class DirectorySummary
         if (roots != null && roots.Count == 1)
         {
             multiRoot = false;
-            string norm = Normalize(roots[0]);
-            displayRoot = norm;
-            scanRoots.Add(norm);
+            string norm = TryNormalize(roots[0]);
+            if (norm.Length > 0)
+            {
+                displayRoot = norm;
+                scanRoots.Add(norm);
+            }
+            else
+            {
+                displayRoot = "";
+            }
             return;
         }
 
@@ -56,19 +70,38 @@ public class DirectorySummary
             for (int i = 0; i < roots.Count; i++)
             {
                 if (string.IsNullOrEmpty(roots[i])) continue;
-                try
-                {
-                    string norm = Normalize(roots[i]);
-                    if (seen.Add(norm)) scanRoots.Add(norm);
-                }
-                catch { }
+                string norm = TryNormalize(roots[i]);
+                if (norm.Length > 0 && seen.Add(norm)) scanRoots.Add(norm);
             }
         }
     }
 
+    private static string TryNormalize(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return "";
+        try { return Normalize(path); }
+        catch { return ""; }
+    }
+
     private static string Normalize(string path)
     {
-        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string canon = PathGuard.Canonical(path);
+        if (canon.Length == 0) canon = Path.GetFullPath(path);
+        return canon.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+    }
+
+    private static string DeriveDirKey(string canonicalFilePath)
+    {
+        if (string.IsNullOrEmpty(canonicalFilePath)) return "";
+        try
+        {
+            string parent = Path.GetDirectoryName(canonicalFilePath);
+            if (string.IsNullOrEmpty(parent)) return "";
+            string canonDir = PathGuard.Canonical(parent);
+            if (canonDir.Length == 0) return "";
+            return canonDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        }
+        catch { return ""; }
     }
 
     public void StartScan(long sessionId)
@@ -82,9 +115,17 @@ public class DirectorySummary
 
         if (!multiRoot)
         {
-            Node root = new Node { Id = 0, Path = scanRoots[0], DisplayName = Name(scanRoots[0]) };
-            nodes.Add(scanRoots[0], root);
-            ids.Add(0, root);
+            if (scanRoots.Count > 0)
+            {
+                Node root = new Node { Id = 0, Path = scanRoots[0], DisplayName = Name(scanRoots[0]) };
+                nodes.Add(scanRoots[0], root);
+                ids.Add(0, root);
+            }
+            else
+            {
+                Node emptyRoot = new Node { Id = 0, Path = displayRoot, DisplayName = displayRoot };
+                ids.Add(0, emptyRoot);
+            }
         }
         else
         {
@@ -145,27 +186,22 @@ public class DirectorySummary
 
     public void UpdateFromRows(List<ListRow> rows, int start)
     {
-        if (scanRoots.Count == 0) return;
+        if (rows == null || scanRoots.Count == 0 || start < 0) return;
         for (int i = start; i < rows.Count; i++)
         {
             ListRow row = rows[i];
-            if (row.IsDirectory) continue;
-            string path, dir;
-            try
-            {
-                path = Path.GetFullPath(row.Path);
-                string rawDir = row.DirectoryPath;
-                if (string.IsNullOrEmpty(rawDir)) rawDir = Path.GetDirectoryName(path);
-                dir = Normalize(rawDir);
-            }
-            catch (ArgumentException) { continue; }
-            catch (NotSupportedException) { continue; }
-            catch (PathTooLongException) { continue; }
+            if (row == null || row.IsDirectory) continue;
+
+            string path = PathGuard.Canonical(row.Path);
+            if (path.Length == 0) continue;
+            string dir = DeriveDirKey(path);
+            if (dir.Length == 0) continue;
 
             string matchedRoot = FindMatchingRoot(dir);
             if (matchedRoot == null || files.ContainsKey(path)) continue;
 
             Node node = EnsureNode(dir, matchedRoot);
+            if (node == null) continue;
             files.Add(path, row);
             node.Files.Add(path, row);
             Adjust(node, row, 1);
@@ -174,19 +210,61 @@ public class DirectorySummary
 
     private Node EnsureNode(string dir, string stopRoot)
     {
-        Node node;
-        if (nodes.TryGetValue(dir, out node)) return node;
-        if (string.Equals(dir, stopRoot, StringComparison.OrdinalIgnoreCase))
+        Node existing;
+        if (nodes.TryGetValue(dir, out existing)) return existing;
+
+        Stack<string> missing = new Stack<string>();
+        string cur = dir;
+        Node anchor = null;
+
+        while (true)
         {
-            return nodes[stopRoot];
+            if (nodes.TryGetValue(cur, out anchor)) break;
+            if (string.Equals(cur, stopRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!nodes.TryGetValue(stopRoot, out anchor)) return null;
+                break;
+            }
+
+            missing.Push(cur);
+            string trimmed = cur.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string parentRaw = null;
+            try { parentRaw = Path.GetDirectoryName(trimmed); }
+            catch { parentRaw = null; }
+
+            if (string.IsNullOrEmpty(parentRaw))
+            {
+                nodes.TryGetValue(stopRoot, out anchor);
+                break;
+            }
+
+            string parentDir = TryNormalize(parentRaw);
+            if (parentDir.Length == 0
+                || string.Equals(parentDir, cur, StringComparison.OrdinalIgnoreCase))
+            {
+                nodes.TryGetValue(stopRoot, out anchor);
+                break;
+            }
+
+            cur = parentDir;
         }
-        string parentDir = Normalize(Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar)));
-        Node parent = EnsureNode(parentDir, stopRoot);
-        node = new Node { Id = nextId++, Path = dir, DisplayName = Name(dir), Parent = parent };
-        nodes.Add(dir, node);
-        ids.Add(node.Id, node);
-        parent.Children.Add(node);
-        return node;
+
+        if (anchor == null) return null;
+        Node parent = anchor;
+        while (missing.Count > 0)
+        {
+            string nextDir = missing.Pop();
+            Node node;
+            if (!nodes.TryGetValue(nextDir, out node))
+            {
+                node = new Node { Id = nextId++, Path = nextDir, DisplayName = Name(nextDir), Parent = parent };
+                nodes.Add(nextDir, node);
+                ids.Add(node.Id, node);
+                parent.Children.Add(node);
+            }
+            parent = node;
+        }
+        return parent;
     }
 
     private static void Adjust(Node node, ListRow row, int delta)
@@ -205,15 +283,18 @@ public class DirectorySummary
 
     public void RemoveRows(List<ListRow> removed)
     {
+        if (removed == null) return;
         foreach (ListRow row in removed)
         {
-            string path;
-            try { path = Path.GetFullPath(row.Path); }
-            catch { continue; }
+            if (row == null) continue;
+            string path = PathGuard.Canonical(row.Path);
+            if (path.Length == 0) continue;
             ListRow original;
             if (!files.TryGetValue(path, out original)) continue;
+            string dir = DeriveDirKey(path);
+            if (dir.Length == 0) continue;
             Node node;
-            if (!nodes.TryGetValue(Normalize(Path.GetDirectoryName(path)), out node)) continue;
+            if (!nodes.TryGetValue(dir, out node)) continue;
             files.Remove(path);
             node.Files.Remove(path);
             Adjust(node, original, -1);

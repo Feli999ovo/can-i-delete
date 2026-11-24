@@ -6,6 +6,120 @@ using System.Text.RegularExpressions;
 // Display-only interpretation of existing observations. Never feeds Rules, Safety or deletion.
 public static class AnPingExplanation
 {
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(200);
+    private const RegexOptions RxOpts = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+
+    private static readonly Regex RxBrowserProfileDir = new Regex(
+        @"[\\/]((Microsoft[\\/])?Edge|(Google[\\/])?Chrome|(BraveSoftware[\\/])?Brave(-Browser)?|Vivaldi)[\\/]User Data[\\/]"
+        + @"|[\\/](Opera Software[\\/])?Opera( GX)?( Stable)?[\\/]"
+        + @"|[\\/](Mozilla[\\/])?Firefox[\\/]Profiles[\\/]",
+        RxOpts, RegexTimeout);
+    private static readonly Regex RxSdDownload = new Regex(@"[\\/]SoftwareDistribution[\\/]Download([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxChrome = new Regex(@"Google[\\/]Chrome|[\\/]Chrome[\\/]User Data", RxOpts, RegexTimeout);
+    private static readonly Regex RxEdge = new Regex(@"Microsoft[\\/]Edge|[\\/]Edge[\\/]User Data", RxOpts, RegexTimeout);
+    private static readonly Regex RxFirefox = new Regex(@"[\\/](Mozilla[\\/])?Firefox([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxBrave = new Regex(@"Brave-Browser|[\\/]Brave[\\/]User Data", RxOpts, RegexTimeout);
+    private static readonly Regex RxVivaldi = new Regex(@"[\\/]Vivaldi([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxOpera = new Regex(@"Opera GX|Opera Stable|[\\/]Opera( Software)?[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxGoBuild = new Regex(@"[\\/]go-build([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxUvCache = new Regex(@"[\\/]uv[\\/]cache([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxNpmCache = new Regex(@"npm-cache|_cacache", RxOpts, RegexTimeout);
+    private static readonly Regex RxPip = new Regex(@"[\\/]pip[\\/]|\.whl$", RxOpts, RegexTimeout);
+    private static readonly Regex RxNuGet = new Regex(@"nuget|v3-cache|\.nupkg$", RxOpts, RegexTimeout);
+    private static readonly Regex RxYarn = new Regex(@"yarn", RxOpts, RegexTimeout);
+    private static readonly Regex RxPnpm = new Regex(@"pnpm", RxOpts, RegexTimeout);
+    private static readonly Regex RxNvidia = new Regex(@"[\\/]NVIDIA([\\/]| Corporation[\\/])", RxOpts, RegexTimeout);
+    private static readonly Regex RxAmd = new Regex(@"[\\/]AMD[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxIntel = new Regex(@"[\\/]Intel[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxTempInstaller = new Regex(@"[\\/]temp[\\/](is-|ns|squirreltemp|scoped_dir|msi|\{|chrome_installer|msedge_installer|(edge|chrome)_bits_|pip-|npm-[0-9]|pyinstaller-)", RxOpts, RegexTimeout);
+    private static readonly Regex RxTempDir = new Regex(@"[\\/]temp[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWxWork = new Regex(@"[\\/]WXWork([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxQq = new Regex(@"Tencent[\\/]QQ|[\\/](nt_qq|Tencent Files)([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxSnsCache = new Regex(@"[\\/]Sns[\\/]Cache([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxApplet = new Regex(@"[\\/](Applet|WMPFRuntime)([\\/]|$)|\.wxapkg$", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatWeb = new Regex(@"[\\/](XPlugin|xweb|radium)([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxCode = new Regex(@"[\\/]Code( - Insiders)?[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxCursor = new Regex(@"[\\/]Cursor[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxLark = new Regex(@"[\\/](LarkShell|Feishu)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxDingTalk = new Regex(@"[\\/]DingTalk[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxCloudMusic = new Regex(@"[\\/]CloudMusic[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxDiscord = new Regex(@"[\\/]Discord[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxSlack = new Regex(@"[\\/]Slack[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxNotion = new Regex(@"[\\/]Notion[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxObsidian = new Regex(@"[\\/]Obsidian[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxPostman = new Regex(@"[\\/]Postman[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxFigma = new Regex(@"[\\/]Figma[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxTeams = new Regex(@"[\\/](Teams|MSTeams)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxSteam = new Regex(@"[\\/]Steam[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxAppQq = new Regex(@"[\\/](QQ|nt_qq)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeMeet = new Regex(@"[\\/](WeMeet|wemeetapp)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxAppWxWork = new Regex(@"[\\/]WXWork[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxBaiduNetdisk = new Regex(@"[\\/]BaiduNetdisk[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxEbWebView = new Regex(@"[\\/]EBWebView[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxCachedVsix = new Regex(@"[\\/]CachedExtensionVsiXs[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxCachedData = new Regex(@"[\\/]CachedData[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWinCoreDir = new Regex(@"[\\/]Windows[\\/](WinSxS|System32|SysWOW64|System)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWinSxS = new Regex(@"[\\/]WinSxS[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWinSdDownload = new Regex(@"[\\/]Windows[\\/]SoftwareDistribution[\\/]Download([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxWinPrefetch = new Regex(@"[\\/]Windows[\\/]Prefetch([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxWinOld = new Regex(@"^[a-z]:[\\/]Windows\.old[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxArchivePreview = new Regex(@"[\\/]temp[\\/](7z[a-z0-9]+|rar\$[a-z0-9._-]+|wz[0-9a-f]+)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxEditorUserDir = new Regex(@"[\\/](Code( - Insiders)?|Cursor|VSCodium|Windsurf)[\\/]User[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxCursorUserDir = new Regex(@"[\\/]Cursor[\\/]User[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatMsgAttach = new Regex(@"[\\/]WeChat Files[\\/][^\\/]+[\\/]FileStorage[\\/]MsgAttach[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatImgExt = new Regex(@"^\.(jpg|jpeg|png|webp|heic)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxChatDataDir = new Regex(@"[\\/](WeChat Files|xwechat_files|WXWork|Tencent Files)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatPureSub = new Regex(@"[\\/](SNS[\\/]Cache|Cache[\\/]Sns|Applet|WMPF|WMPFRuntime|XPlugin|xweb|radium)([\\/]|$)", RxOpts, RegexTimeout);
+    private static readonly Regex RxQqRecvDir = new Regex(@"[\\/](FileRecv|MobileFile)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatFileDir = new Regex(@"[\\/]FileStorage[\\/]File[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWxWorkFileSub = new Regex(@"[\\/](File|Cache[\\/]File|msg[\\/]file)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWxWorkCacheFileSub = new Regex(@"[\\/](Cache[\\/]File|msg[\\/]file)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatVideoDir = new Regex(@"[\\/]FileStorage[\\/]Video[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatImageDir = new Regex(@"[\\/]FileStorage[\\/]Image[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxWeChatMsgAttachAny = new Regex(@"[\\/]FileStorage[\\/]MsgAttach[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxChatVideoDir = new Regex(@"[\\/](MsgVideo|Video)[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxChatVideoExt = new Regex(@"^\.(mp4|mov|avi|mkv)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxVmDiskExt = new Regex(@"^\.(vhdx|vhd|vmdk|vdi|qcow2)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxWslDocker = new Regex(@"wsl|docker|ext4\.vhdx|canonical|distro", RxOpts, RegexTimeout);
+    private static readonly Regex RxIsoImgExt = new Regex(@"^\.(iso|img|wim|esd)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxExePkgExt = new Regex(@"^\.(exe|msi|msix|appx)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxInstalledProgDir = new Regex(@"[\\/](Program Files|Program Files \(x86\)|WindowsApps)[\\/]|[\\/]AppData[\\/]Local[\\/]Programs[\\/]", RxOpts, RegexTimeout);
+    private static readonly Regex RxInstallerName = new Regex(@"setup|install|installer|update|patch|_x64|_win64|安装包", RxOpts, RegexTimeout);
+    private static readonly Regex RxArchiveExt = new Regex(@"^\.(zip|rar|7z|tar|gz|tgz|bz2|xz)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxMediaExt = new Regex(@"^\.(mp4|mkv|mov|avi|wmv|flv|webm|m4v|ts|mp3|flac|wav|m4a|aac|ogg)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxAudioExt = new Regex(@"^\.(mp3|flac|wav|m4a|aac|ogg)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxDesignExt = new Regex(@"^\.(psd|psb|ai|prproj|aep|blend|sketch|fig|dwg|dxf)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxDocExt = new Regex(@"^\.(pdf|docx|doc|xlsx|xls|pptx|ppt|csv|rtf|odt|ods|odp|vsdx|vsd|md|txt|pages|numbers|key)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxPhotoExt = new Regex(@"^\.(jpg|jpeg|png|webp|heic|gif|bmp|raw|cr2|nef|arw)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxPartialDlExt = new Regex(@"^\.(crdownload|part|download|opdownload)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxLogExt = new Regex(@"^\.(log|etl|evtx)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxBackupExt = new Regex(@"^\.(bak|old|orig)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxDbExt = new Regex(@"^\.(db|sqlite|sqlite3|mdb|accdb|mdf|ldf)$", RxOpts, RegexTimeout);
+    private static readonly Regex RxUserDlDesktop = new Regex(@"[\\/](Downloads|Download|Desktop|桌面|下载)[\\/]", RxOpts, RegexTimeout);
+
+    private static bool SafeIsMatch(Regex re, string input)
+    {
+        if (re == null || string.IsNullOrEmpty(input)) return false;
+        try { return re.IsMatch(input); }
+        catch { return false; }
+    }
+
+    private static string NormalizeExplanationPath(string rawPath)
+    {
+        if (string.IsNullOrEmpty(rawPath)) return "";
+        string canon = PathGuard.Canonical(rawPath);
+        if (canon.Length > 0) return canon;
+        string s = rawPath.Trim();
+        if (s.StartsWith("\\\\?\\", StringComparison.Ordinal) && !s.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+        {
+            string stripped = s.Substring(4);
+            string strippedCanon = PathGuard.Canonical(stripped);
+            if (strippedCanon.Length > 0) return strippedCanon;
+            return stripped;
+        }
+        try { return Path.GetFullPath(s); }
+        catch { return s; }
+    }
     public sealed class Evidence
     {
         public string state, text, strength;
@@ -58,24 +172,20 @@ public static class AnPingExplanation
         if (ext.Length > 0)
             d.evidence.Add(new Evidence("y", "名称带有 " + ext + " 扩展名；单凭它不能识别用途", "弱证据"));
 
-        string full = "";
-        try { full = Path.GetFullPath(rawPath); }
-        catch (ArgumentException) { full = rawPath; }
-        catch (NotSupportedException) { full = rawPath; }
-        catch (PathTooLongException) { full = rawPath; }
-
+        string full = NormalizeExplanationPath(rawPath);
         string fileName = !string.IsNullOrEmpty(r.Name) ? r.Name : TryGetFileName(full);
-        string dirName = TryGetDirName(full);
+        string dirName = PathGuard.Canonical(TryGetDirName(full));
         bool skipGenericUnknownProcess = false;
 
         string installerCache = "";
-        try { installerCache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Installer"); }
+        try { installerCache = PathGuard.Canonical(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Installer")); }
         catch { }
 
         // 1. Windows Installer 维护缓存（微软官方 KB 2667628）
         if (!r.IsDirectory && full.Length > 0 && installerCache.Length > 0
-            && string.Equals(dirName, installerCache, StringComparison.OrdinalIgnoreCase)
-            && (ext == ".msi" || ext == ".msp"))
+            && (string.Equals(dirName, installerCache, StringComparison.OrdinalIgnoreCase)
+                || PathGuard.IsInside(installerCache, full))
+            && (ext == ".msi" || ext == ".msp" || ext == ".mst"))
         {
             d.type = "Windows 安装程序缓存";
             d.purpose = "可能是为软件修复、更新或卸载保留的安装包副本。";
@@ -164,26 +274,7 @@ public static class AnPingExplanation
     private static bool IsProtectedBrowserUserData(string full, string fileName)
     {
         if (string.IsNullOrEmpty(full) || string.IsNullOrEmpty(fileName)) return false;
-
-        bool inBrowserProfile = Regex.IsMatch(
-            full,
-            @"[\\/]((Microsoft[\\/])?Edge|(Google[\\/])?Chrome|(BraveSoftware[\\/])?Brave(-Browser)?|Vivaldi)[\\/]User Data[\\/]"
-            + @"|[\\/](Opera Software[\\/])?Opera( GX)?( Stable)?[\\/]"
-            + @"|[\\/](Mozilla[\\/])?Firefox[\\/]Profiles[\\/]",
-            RegexOptions.IgnoreCase);
-        if (!inBrowserProfile) return false;
-
-        if (Regex.IsMatch(
-                fileName,
-                @"^(Cookies|Login Data|Web Data|History|Bookmarks|Preferences|Secure Preferences|Favicons|Shortcuts|Top Sites|Visited Links|cookies\.sqlite|places\.sqlite|key4\.db|logins\.json|cert9\.db|formhistory\.sqlite|webappsstore\.sqlite|permissions\.sqlite|content-prefs\.sqlite)(-journal|-wal|-shm|\.bak|\.msbak)?$",
-                RegexOptions.IgnoreCase))
-        {
-            return true;
-        }
-        if (fileName.StartsWith("sessionstore", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
+        if (!SafeIsMatch(RxBrowserProfileDir, full)) return false;
         return CacheRoots.IsBrowserProtectedPath(fileName, full);
     }
 
@@ -193,12 +284,7 @@ public static class AnPingExplanation
             return true;
         if (string.IsNullOrEmpty(full))
             return false;
-        if (ChatStorageLocator.IsChatDatabasePath(full))
-            return true;
-        return Regex.IsMatch(
-            full,
-            @"(WeChat Files|xwechat_files|WXWork|Tencent Files)[\\/].*[\\/](Msg|nt_msg|nt_db)[\\/].+\.(db|db-wal|db-shm|idx)$",
-            RegexOptions.IgnoreCase);
+        return ChatStorageLocator.IsChatDatabasePath(full);
     }
 
     private static bool TryApplyCacheRuleExplanation(ListRow r, string full, Detail d, out bool skipGenericUnknownProcess)
@@ -313,7 +399,7 @@ public static class AnPingExplanation
         if (isUnderCooldown)
         {
             if (r.RuleId == "TMP-WINUPDATE"
-                || Regex.IsMatch(full, @"[\\/]SoftwareDistribution[\\/]Download([\\/]|$)", RegexOptions.IgnoreCase))
+                || SafeIsMatch(RxSdDownload, full))
             {
                 d.type = "Windows 更新下载缓存";
                 d.purpose = "Windows Update 近期下载、可能正待安装的更新包。";
@@ -411,21 +497,21 @@ public static class AnPingExplanation
 
         if (r.RuleId == "TMP-BROWSERCACHE")
         {
-            if (Regex.IsMatch(full, @"Google[\\/]Chrome|[\\/]Chrome[\\/]User Data", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxChrome, full))
             {
                 appName = "Google Chrome";
                 shortApp = " Chrome ";
                 activeType = "Chrome 网页与渲染缓存";
                 lockedType = "Chrome 缓存（正在使用）";
             }
-            else if (Regex.IsMatch(full, @"Microsoft[\\/]Edge|[\\/]Edge[\\/]User Data", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxEdge, full))
             {
                 appName = "Microsoft Edge";
                 shortApp = " Edge ";
                 activeType = "Edge 网页与渲染缓存";
                 lockedType = "Edge 缓存（正在使用）";
             }
-            else if (Regex.IsMatch(full, @"[\\/](Mozilla[\\/])?Firefox([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxFirefox, full))
             {
                 appName = "Mozilla Firefox";
                 shortApp = " Firefox ";
@@ -433,7 +519,7 @@ public static class AnPingExplanation
                 lockedType = "Firefox 缓存（正在使用）";
                 customPurpose = "Mozilla Firefox 保存的网页资源或启动缓存。";
             }
-            else if (Regex.IsMatch(full, @"Brave-Browser|[\\/]Brave[\\/]User Data", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxBrave, full))
             {
                 appName = "Brave 浏览器";
                 shortApp = " Brave ";
@@ -441,7 +527,7 @@ public static class AnPingExplanation
                 lockedType = "Brave 缓存（正在使用）";
                 customPurpose = "Brave 浏览器保存的网页资源、脚本或渲染缓存。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]Vivaldi([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxVivaldi, full))
             {
                 appName = "Vivaldi 浏览器";
                 shortApp = " Vivaldi ";
@@ -449,7 +535,7 @@ public static class AnPingExplanation
                 lockedType = "Vivaldi 缓存（正在使用）";
                 customPurpose = "Vivaldi 浏览器保存的网页资源、脚本或渲染缓存。";
             }
-            else if (Regex.IsMatch(full, @"Opera GX|Opera Stable|[\\/]Opera( Software)?[\\/]", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxOpera, full))
             {
                 appName = "Opera 浏览器";
                 shortApp = " Opera ";
@@ -474,7 +560,7 @@ public static class AnPingExplanation
         }
         else if (r.RuleId == "TMP-PKGCACHE")
         {
-            if (Regex.IsMatch(full, @"[\\/]go-build([\\/]|$)", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxGoBuild, full))
             {
                 appName = "Go 工具链";
                 shortApp = " Go ";
@@ -482,7 +568,7 @@ public static class AnPingExplanation
                 lockedType = "Go 编译缓存（正在使用）";
                 customPurpose = "Go 编译器生成的中间构建与增量编译缓存。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]uv[\\/]cache([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxUvCache, full))
             {
                 appName = "Python uv";
                 shortApp = " uv ";
@@ -490,27 +576,27 @@ public static class AnPingExplanation
                 lockedType = "Python uv 缓存（正在使用）";
                 customPurpose = "Python uv 包管理器下载的离线轮子与元数据缓存。";
             }
-            else if (Regex.IsMatch(full, @"npm-cache|_cacache", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxNpmCache, full))
             {
                 appName = "npm";
                 shortApp = " npm ";
             }
-            else if (Regex.IsMatch(full, @"[\\/]pip[\\/]|\.whl$", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxPip, full))
             {
                 appName = "Python pip";
                 shortApp = " pip ";
             }
-            else if (Regex.IsMatch(full, @"nuget|v3-cache|\.nupkg$", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxNuGet, full))
             {
                 appName = "NuGet";
                 shortApp = " NuGet ";
             }
-            else if (Regex.IsMatch(full, @"yarn", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxYarn, full))
             {
                 appName = "Yarn";
                 shortApp = " Yarn ";
             }
-            else if (Regex.IsMatch(full, @"pnpm", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxPnpm, full))
             {
                 appName = "pnpm";
                 shortApp = " pnpm ";
@@ -523,7 +609,7 @@ public static class AnPingExplanation
         }
         else if (r.RuleId == "TMP-SHADERCACHE")
         {
-            if (Regex.IsMatch(full, @"[\\/]NVIDIA([\\/]| Corporation[\\/])", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxNvidia, full))
             {
                 appName = "NVIDIA 显卡驱动";
                 shortApp = "显卡驱动";
@@ -531,7 +617,7 @@ public static class AnPingExplanation
                 lockedType = "NVIDIA 着色器缓存（正在使用）";
                 customPurpose = "NVIDIA 显卡驱动保存的已编译图形着色器缓存。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]AMD[\\/]", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxAmd, full))
             {
                 appName = "AMD 显卡驱动";
                 shortApp = "显卡驱动";
@@ -539,7 +625,7 @@ public static class AnPingExplanation
                 lockedType = "AMD 着色器缓存（正在使用）";
                 customPurpose = "AMD 显卡驱动保存的已编译图形着色器缓存。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]Intel[\\/]", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxIntel, full))
             {
                 appName = "Intel 图形驱动";
                 shortApp = "图形驱动";
@@ -558,13 +644,15 @@ public static class AnPingExplanation
             appName = "后台程序";
             shortApp = "程序";
             lockedType = "系统临时文件（正在使用）";
-            if (Regex.IsMatch(full, @"[\\/]temp[\\/](is-|ns|squirreltemp|scoped_dir|msi|\{|chrome_installer|msedge_installer|(edge|chrome)_bits_|pip-|npm-[0-9]|pyinstaller-)", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxTempInstaller, full))
             {
                 activeType = "过期的安装或解压临时残留";
                 lockedType = "安装或解压临时文件（正在使用）";
                 customPurpose = "软件安装、更新或解包完成后遗留的旧临时文件。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]temp[\\/].+\.(log|etl)$", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxTempDir, full)
+                     && (full.EndsWith(".log", StringComparison.OrdinalIgnoreCase)
+                         || full.EndsWith(".etl", StringComparison.OrdinalIgnoreCase)))
             {
                 activeType = "过期的临时诊断日志";
                 lockedType = "临时诊断日志（正在使用）";
@@ -579,7 +667,7 @@ public static class AnPingExplanation
         }
         else if (r.RuleId == "TMP-CHATCACHE")
         {
-            if (Regex.IsMatch(full, @"[\\/]WXWork([\\/]|$)", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxWxWork, full))
             {
                 appName = "企业微信";
                 shortApp = "企业微信";
@@ -587,7 +675,7 @@ public static class AnPingExplanation
                 lockedType = "企业微信缓存（正在使用）";
                 customPurpose = "企业微信自动生成的动态媒体或内置网页缓存。";
             }
-            else if (Regex.IsMatch(full, @"Tencent[\\/]QQ|[\\/](nt_qq|Tencent Files)([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxQq, full))
             {
                 appName = "QQ";
                 shortApp = " QQ ";
@@ -595,7 +683,7 @@ public static class AnPingExplanation
                 lockedType = "QQ 缓存（正在使用）";
                 customPurpose = "QQ 运行期间生成的临时缓存与内置网页资源。";
             }
-            else if (Regex.IsMatch(full, @"[\\/]Sns[\\/]Cache([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxSnsCache, full))
             {
                 appName = "微信";
                 shortApp = "微信";
@@ -603,7 +691,7 @@ public static class AnPingExplanation
                 lockedType = "微信朋友圈缓存（正在使用）";
                 customPurpose = "浏览微信朋友圈时自动缓存的图片或视频副本。";
             }
-            else if (Regex.IsMatch(full, @"[\\/](Applet|WMPFRuntime)([\\/]|$)|\.wxapkg$", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxApplet, full))
             {
                 appName = "微信";
                 shortApp = "微信";
@@ -611,7 +699,7 @@ public static class AnPingExplanation
                 lockedType = "微信小程序缓存（正在使用）";
                 customPurpose = "打开微信小程序时自动下载的运行包与资源缓存。";
             }
-            else if (Regex.IsMatch(full, @"[\\/](XPlugin|xweb|radium)([\\/]|$)", RegexOptions.IgnoreCase))
+            else if (SafeIsMatch(RxWeChatWeb, full))
             {
                 appName = "微信";
                 shortApp = "微信";
@@ -655,92 +743,92 @@ public static class AnPingExplanation
 
         string matchedApp = "";
         string matchedShort = "";
-        if (Regex.IsMatch(full, @"[\\/]Code( - Insiders)?[\\/]", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxCode, full))
         {
             matchedApp = "VS Code";
             matchedShort = " VS Code ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Cursor[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxCursor, full))
         {
             matchedApp = "Cursor";
             matchedShort = " Cursor ";
         }
-        else if (Regex.IsMatch(full, @"[\\/](LarkShell|Feishu)[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxLark, full))
         {
             matchedApp = "飞书";
             matchedShort = "飞书";
         }
-        else if (Regex.IsMatch(full, @"[\\/]DingTalk[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxDingTalk, full))
         {
             matchedApp = "钉钉";
             matchedShort = "钉钉";
         }
-        else if (Regex.IsMatch(full, @"[\\/]CloudMusic[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxCloudMusic, full))
         {
             matchedApp = "网易云音乐";
             matchedShort = "网易云音乐";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Discord[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxDiscord, full))
         {
             matchedApp = "Discord";
             matchedShort = " Discord ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Slack[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxSlack, full))
         {
             matchedApp = "Slack";
             matchedShort = " Slack ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Notion[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxNotion, full))
         {
             matchedApp = "Notion";
             matchedShort = " Notion ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Obsidian[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxObsidian, full))
         {
             matchedApp = "Obsidian";
             matchedShort = " Obsidian ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Postman[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxPostman, full))
         {
             matchedApp = "Postman";
             matchedShort = " Postman ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Figma[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxFigma, full))
         {
             matchedApp = "Figma";
             matchedShort = " Figma ";
         }
-        else if (Regex.IsMatch(full, @"[\\/](Teams|MSTeams)[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxTeams, full))
         {
             matchedApp = "Microsoft Teams";
             matchedShort = " Teams ";
         }
-        else if (Regex.IsMatch(full, @"[\\/]Steam[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxSteam, full))
         {
             matchedApp = "Steam";
             matchedShort = " Steam ";
         }
-        else if (Regex.IsMatch(full, @"[\\/](QQ|nt_qq)[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxAppQq, full))
         {
             matchedApp = "QQ";
             matchedShort = " QQ ";
         }
-        else if (Regex.IsMatch(full, @"[\\/](WeMeet|wemeetapp)[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxWeMeet, full))
         {
             matchedApp = "腾讯会议";
             matchedShort = "腾讯会议";
         }
-        else if (Regex.IsMatch(full, @"[\\/]WXWork[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxAppWxWork, full))
         {
             matchedApp = "企业微信";
             matchedShort = "企业微信";
         }
-        else if (Regex.IsMatch(full, @"[\\/]BaiduNetdisk[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxBaiduNetdisk, full))
         {
             matchedApp = "百度网盘";
             matchedShort = "百度网盘";
         }
-        else if (Regex.IsMatch(full, @"[\\/]EBWebView[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxEbWebView, full))
         {
             matchedApp = "WebView2 桌面组件";
             matchedShort = "桌面组件";
@@ -753,12 +841,12 @@ public static class AnPingExplanation
 
         appName = matchedApp;
         shortApp = matchedShort;
-        if (Regex.IsMatch(full, @"[\\/]CachedExtensionVsiXs[\\/]", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxCachedVsix, full))
         {
             activeType = matchedApp + " 插件安装包缓存";
             customPurpose = matchedApp + " 下载安装扩展后留存的离线插件包副本。";
         }
-        else if (Regex.IsMatch(full, @"[\\/]CachedData[\\/]", RegexOptions.IgnoreCase))
+        else if (SafeIsMatch(RxCachedData, full))
         {
             activeType = matchedApp + " 编译字节码缓存";
             customPurpose = matchedApp + " 为加速界面启动生成的脚本编译缓存。";
@@ -816,9 +904,9 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/]Windows[\\/](WinSxS|System32|SysWOW64|System)[\\/]", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxWinCoreDir, full))
         {
-            bool isWinSxS = Regex.IsMatch(full, @"[\\/]WinSxS[\\/]", RegexOptions.IgnoreCase);
+            bool isWinSxS = SafeIsMatch(RxWinSxS, full);
             d.type = isWinSxS ? "Windows 组件存储库 (WinSxS)" : "Windows 系统核心组件";
             d.purpose = "Windows 运行、更新与驱动依赖的核心系统组件。";
             d.basis = "位于 Windows 受保护核心系统目录";
@@ -835,7 +923,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/]Windows[\\/]SoftwareDistribution[\\/]Download([\\/]|$)", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxWinSdDownload, full))
         {
             d.type = "Windows 更新下载缓存";
             d.purpose = "系统更新下载的安装包缓存副本。";
@@ -853,7 +941,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/]Windows[\\/]Prefetch([\\/]|$)", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxWinPrefetch, full))
         {
             d.type = "Windows 启动预读取优化文件";
             d.purpose = "系统记录常用软件启动顺序以加速打开的数据。";
@@ -871,7 +959,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"^[a-z]:[\\/]Windows\.old[\\/]", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxWinOld, full))
         {
             d.type = "旧版 Windows 升级备份文件";
             d.purpose = "系统大版本升级后留存的旧系统备份（Windows.old）。";
@@ -889,7 +977,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/]temp[\\/](7z[a-z0-9]+|rar\$[a-z0-9._-]+|wz[0-9a-f]+)[\\/]", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxArchivePreview, full))
         {
             d.type = "压缩包临时预览文件" + (ext.Length > 0 ? " (" + ext + ")" : "");
             d.purpose = "在压缩软件内直接打开文件时临时解压出的副本。";
@@ -907,9 +995,9 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/](Code( - Insiders)?|Cursor)[\\/]User[\\/].+\.json$", RegexOptions.IgnoreCase))
+        if (SafeIsMatch(RxEditorUserDir, full) && string.Equals(ext, ".json", StringComparison.OrdinalIgnoreCase))
         {
-            bool isCursor = Regex.IsMatch(full, @"[\\/]Cursor[\\/]User[\\/]", RegexOptions.IgnoreCase);
+            bool isCursor = SafeIsMatch(RxCursorUserDir, full);
             string edName = isCursor ? "Cursor" : "VS Code";
             d.type = edName + " 个人配置文件 (.json)";
             d.purpose = edName + " 保存的个人偏好设置、快捷键或状态配置。";
@@ -928,8 +1016,8 @@ public static class AnPingExplanation
         }
 
         // B. 微信 / 企业微信 / QQ 聊天数据目录
-        if (Regex.IsMatch(full, @"[\\/]WeChat Files[\\/][^\\/]+[\\/]FileStorage[\\/]MsgAttach[\\/]", RegexOptions.IgnoreCase)
-            && Regex.IsMatch(ext, @"^\.(jpg|jpeg|png|webp|heic)$"))
+        if (SafeIsMatch(RxWeChatMsgAttach, full)
+            && SafeIsMatch(RxWeChatImgExt, ext))
         {
             d.type = "微信收到的图片";
             d.purpose = "可能是微信收到的图片；是否原图尚未核实。";
@@ -946,12 +1034,12 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(full, @"[\\/](WeChat Files|xwechat_files|WXWork|Tencent Files)[\\/]", RegexOptions.IgnoreCase)
+        if (SafeIsMatch(RxChatDataDir, full)
             || ChatStorageLocator.IsChatReceivedUserFile(full))
         {
-            if (Regex.IsMatch(full, @"(WeChat Files|xwechat_files|WXWork)[\\/].*[\\/](SNS[\\/]Cache|Applet|WMPF|WMPFRuntime|XPlugin|xweb|radium)([\\/]|$)", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxWeChatPureSub, full))
             {
-                bool isSns = Regex.IsMatch(full, @"[\\/]SNS[\\/]Cache([\\/]|$)", RegexOptions.IgnoreCase);
+                bool isSns = SafeIsMatch(RxSnsCache, full);
                 d.type = isSns ? "微信朋友圈缓存" : "微信小程序缓存";
                 d.purpose = "浏览朋友圈或打开小程序自动生成的缓存，非聊天原件。";
                 d.basis = "微信朋友圈或小程序专用缓存目录";
@@ -968,8 +1056,7 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/]Tencent Files[\\/].*[\\/](FileRecv|MobileFile)[\\/]", RegexOptions.IgnoreCase)
-                || Regex.IsMatch(full, @"[\\/](FileRecv|MobileFile)[\\/]", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxQqRecvDir, full))
             {
                 d.type = "QQ 聊天接收文件";
                 d.purpose = "QQ 好友、群聊或手机传来的文件原件。";
@@ -987,7 +1074,7 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/]FileStorage[\\/]File[\\/]", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxWeChatFileDir, full))
             {
                 d.type = "微信聊天接收文件";
                 d.purpose = "好友或群聊发送并下载到本地的文档或压缩包。";
@@ -1005,8 +1092,8 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/]WXWork[\\/].*[\\/](File|Cache[\\/]File|msg[\\/]file)[\\/]", RegexOptions.IgnoreCase)
-                || Regex.IsMatch(full, @"[\\/](Cache[\\/]File|msg[\\/]file)[\\/]", RegexOptions.IgnoreCase))
+            if ((SafeIsMatch(RxWxWork, full) && SafeIsMatch(RxWxWorkFileSub, full))
+                || SafeIsMatch(RxWxWorkCacheFileSub, full))
             {
                 d.type = "企业微信聊天接收文件";
                 d.purpose = "企业微信会话中接收下载的工作文档或附件。";
@@ -1024,7 +1111,7 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/]FileStorage[\\/]Video[\\/]", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxWeChatVideoDir, full))
             {
                 d.type = "微信聊天视频";
                 d.purpose = "聊天中接收或保存的视频文件。";
@@ -1042,8 +1129,8 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/]FileStorage[\\/]Image[\\/]", RegexOptions.IgnoreCase)
-                || (Regex.IsMatch(full, @"[\\/]FileStorage[\\/]MsgAttach[\\/]", RegexOptions.IgnoreCase) && ext == ".dat"))
+            if (SafeIsMatch(RxWeChatImageDir, full)
+                || (SafeIsMatch(RxWeChatMsgAttachAny, full) && ext == ".dat"))
             {
                 d.type = "微信聊天加密图片";
                 d.purpose = "微信聊天中接收的图片本地加密存储文件。";
@@ -1061,8 +1148,8 @@ public static class AnPingExplanation
                 return;
             }
 
-            if (Regex.IsMatch(full, @"[\\/](MsgVideo|Video)[\\/]", RegexOptions.IgnoreCase)
-                || Regex.IsMatch(ext, @"^\.(mp4|mov|avi|mkv)$"))
+            if (SafeIsMatch(RxChatVideoDir, full)
+                || SafeIsMatch(RxChatVideoExt, ext))
             {
                 d.type = "微信 / QQ 聊天视频";
                 d.purpose = "聊天或群聊中接收播放并保存在本地的视频。";
@@ -1097,9 +1184,9 @@ public static class AnPingExplanation
         }
 
         // C. 虚拟机与容器磁盘映像（WSL / Docker / Hyper-V / VMware）
-        if (Regex.IsMatch(ext, @"^\.(vhdx|vhd|vmdk|vdi|qcow2)$"))
+        if (SafeIsMatch(RxVmDiskExt, ext))
         {
-            bool isWslOrDocker = Regex.IsMatch(full, @"wsl|docker|ext4\.vhdx|canonical|distro", RegexOptions.IgnoreCase);
+            bool isWslOrDocker = SafeIsMatch(RxWslDocker, full);
             d.type = isWslOrDocker ? ("WSL / Docker 虚拟磁盘镜像 (" + ext + ")") : ("虚拟机磁盘镜像 (" + ext + ")");
             d.purpose = isWslOrDocker
                 ? "WSL Linux 子系统或 Docker 容器的完整虚拟硬盘。"
@@ -1129,7 +1216,7 @@ public static class AnPingExplanation
         }
 
         // D. 光盘镜像与安装包（.iso / .img / .exe / .msi）
-        if (Regex.IsMatch(ext, @"^\.(iso|img|wim|esd)$"))
+        if (SafeIsMatch(RxIsoImgExt, ext))
         {
             d.type = ext == ".iso" ? "光盘镜像 (.iso)" : ("系统或磁盘镜像 (" + ext + ")");
             d.purpose = "操作系统、大型软件或游戏的光盘安装镜像文件。";
@@ -1149,9 +1236,9 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(exe|msi|msix|appx)$"))
+        if (SafeIsMatch(RxExePkgExt, ext))
         {
-            if (Regex.IsMatch(full, @"[\\/](Program Files|Program Files \(x86\)|WindowsApps)[\\/]|[\\/]AppData[\\/]Local[\\/]Programs[\\/]", RegexOptions.IgnoreCase))
+            if (SafeIsMatch(RxInstalledProgDir, full))
             {
                 d.type = "已安装软件程序文件 (" + ext + ")";
                 d.purpose = "已安装软件的主程序或运行组件。";
@@ -1171,7 +1258,7 @@ public static class AnPingExplanation
 
             bool looksInstaller = ext == ".msi" || ext == ".msix" || ext == ".appx"
                 || IsUserDownloadOrDesktop(full)
-                || Regex.IsMatch(fileName, @"setup|install|installer|update|patch|_x64|_win64|安装包", RegexOptions.IgnoreCase);
+                || SafeIsMatch(RxInstallerName, fileName);
 
             if (looksInstaller)
             {
@@ -1223,7 +1310,7 @@ public static class AnPingExplanation
         }
 
         // E. 压缩包归档（.zip / .rar / .7z / .tar / .gz / .tgz / .bz2 / .xz）
-        if (Regex.IsMatch(ext, @"^\.(zip|rar|7z|tar|gz|tgz|bz2|xz)$"))
+        if (SafeIsMatch(RxArchiveExt, ext))
         {
             d.type = "压缩归档包 (" + ext + ")";
             d.purpose = "打包压缩的文件夹、资料备份或软件分发包。";
@@ -1244,9 +1331,9 @@ public static class AnPingExplanation
         }
 
         // F. 视频 / 音频媒体与设计创作工程文件
-        if (Regex.IsMatch(ext, @"^\.(mp4|mkv|mov|avi|wmv|flv|webm|m4v|ts|mp3|flac|wav|m4a|aac|ogg)$"))
+        if (SafeIsMatch(RxMediaExt, ext))
         {
-            bool isAudio = Regex.IsMatch(ext, @"^\.(mp3|flac|wav|m4a|aac|ogg)$");
+            bool isAudio = SafeIsMatch(RxAudioExt, ext);
             d.type = isAudio ? ("个人音频媒体 (" + ext + ")") : ("个人视频或录屏媒体 (" + ext + ")");
             d.purpose = isAudio ? "音乐、录音或音频素材文件。" : "录屏、视频电影或拍摄素材文件。";
             d.basis = "常见音视频媒体扩展名";
@@ -1264,7 +1351,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(psd|psb|ai|prproj|aep|blend|sketch|fig|dwg|dxf)$"))
+        if (SafeIsMatch(RxDesignExt, ext))
         {
             d.type = "设计或剪辑工程源文件 (" + ext + ")";
             d.purpose = "图像设计、视频剪辑或制图软件的可编辑工程原件。";
@@ -1300,7 +1387,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(pdf|docx|doc|xlsx|xls|pptx|ppt|csv|rtf|odt|ods|odp|vsdx|vsd|md|txt|pages|numbers|key)$"))
+        if (SafeIsMatch(RxDocExt, ext))
         {
             d.type = ext == ".pdf" ? "PDF 文档 (.pdf)" : ("个人办公文档 (" + ext + ")");
             d.purpose = "文档、电子表格、演示文稿或文本阅读资料。";
@@ -1318,7 +1405,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(jpg|jpeg|png|webp|heic|gif|bmp|raw|cr2|nef|arw)$"))
+        if (SafeIsMatch(RxPhotoExt, ext))
         {
             d.type = "个人图片或照片 (" + ext + ")";
             d.purpose = "照片、截图或保存的图像文件。";
@@ -1338,7 +1425,7 @@ public static class AnPingExplanation
         }
 
         // H. 未完成的下载残留
-        if (Regex.IsMatch(ext, @"^\.(crdownload|part|download|opdownload)$") || r.RuleId == "REVIEW-PARTIALDL")
+        if (SafeIsMatch(RxPartialDlExt, ext) || r.RuleId == "REVIEW-PARTIALDL")
         {
             d.type = "未完成的下载残留 (" + (ext.Length > 0 ? ext : "分片") + ")";
             d.purpose = "浏览器或下载工具尚未下载完成的分片文件。";
@@ -1357,7 +1444,7 @@ public static class AnPingExplanation
         }
 
         // I. 日志、备份、数据库与非标准目录转储
-        if (Regex.IsMatch(ext, @"^\.(log|etl|evtx)$"))
+        if (SafeIsMatch(RxLogExt, ext))
         {
             if (ext == ".evtx")
             {
@@ -1392,7 +1479,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(bak|old|orig)$"))
+        if (SafeIsMatch(RxBackupExt, ext))
         {
             d.type = "备份副本文件 (" + ext + ")";
             d.purpose = "软件升级或修改数据前自动留存的旧版本备份。";
@@ -1410,7 +1497,7 @@ public static class AnPingExplanation
             return;
         }
 
-        if (Regex.IsMatch(ext, @"^\.(db|sqlite|sqlite3|mdb|accdb|mdf|ldf)$"))
+        if (SafeIsMatch(RxDbExt, ext))
         {
             d.type = "本地软件数据库 (" + ext + ")";
             d.purpose = "软件保存本地记录、索引、历史或配置的数据文件。";
@@ -1447,7 +1534,7 @@ public static class AnPingExplanation
 
     private static bool IsUserDownloadOrDesktop(string full)
     {
-        return Regex.IsMatch(full, @"[\\/](Downloads|Download|Desktop|桌面|下载)[\\/]", RegexOptions.IgnoreCase);
+        return SafeIsMatch(RxUserDlDesktop, full);
     }
 
     private static bool ContainsText(string haystack, string needle)

@@ -17,3 +17,8 @@ tools/*.exe
 tests/**/*.exe
 tests/*.exe
 _dpi*.png
+*.wav
+*-waveform.json
+*-capture.json
+*-events.json
+tools/data/

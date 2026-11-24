@@ -23,37 +23,13 @@ public static class ChatStorageLocator
 
     private static readonly object mockGate = new object();
     private static ChatDataFolder[] mockChatRoots;
+    private static readonly object discoveredGate = new object();
+    private static string[] cachedDiscoveredChatRoots = new string[0];
 
-    private static readonly Regex StandardChatRootMarkerRegex =
-        new Regex(@"(^|[\\/])(wechat files|xwechat_files|wxwork|tencent files)([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static readonly Regex StandardChatDbRegex =
-        new Regex(@"(^|[\\/])(wechat files|xwechat_files|wxwork|tencent files)[\\/].*[\\/](msg|nt_msg|nt_db)[\\/].+\.(db|db-wal|db-shm|idx)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static readonly Regex RelativeChatDbSubpathRegex =
-        new Regex(@"[\\/](msg|nt_msg|nt_db)[\\/].+\.(db|db-wal|db-shm|idx)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static readonly Regex ProtectedChatSubpathRegex =
-        new Regex(
-            @"[\\/](nt_msg|nt_db)([\\/]|$)"
-            + @"|(^|[\\/])(wechat files|xwechat_files|wxwork|tencent files)[\\/][^\\/]+[\\/]msg([\\/]|$)"
-            + @"|[\\/]filestorage[\\/](file|msgattach|video|image|customemotion|fav)([\\/]|$)"
-            + @"|[\\/](filerecv|mobilefile|customemotion|fav)([\\/]|$)"
-            + @"|[\\/]image[\\/](group|group2|c2c)([\\/]|$)"
-            + @"|[\\/]wxwork[\\/].*[\\/]cache[\\/](file|video)([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static readonly Regex ReceivedUserFileSubpathRegex =
-        new Regex(
-            @"[\\/]filestorage[\\/](file|video|msgattach)[\\/][^\\/]+$"
-            + @"|[\\/]filestorage[\\/](file|video|msgattach)[\\/].+[\\/][^\\/]+$"
-            + @"|[\\/](filerecv|mobilefile)[\\/][^\\/]+$"
-            + @"|[\\/](filerecv|mobilefile)[\\/].+[\\/][^\\/]+$"
-            + @"|[\\/]wxwork[\\/].*[\\/]cache[\\/](file|video)[\\/].*[^\\/]$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(200);
+    private static readonly Regex MsgClassicDbNameRegex =
+        new Regex(@"^msg[23]\.0\.db(?:-wal|-shm|-journal)?$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
 
     /// <summary>仅供沙盒自动化测试注入模拟聊天数据根目录（传空数组可测无聊天目录分支）。</summary>
     public static void SetMockChatRootsForTest(ChatDataFolder[] roots)
@@ -136,44 +112,57 @@ public static class ChatStorageLocator
             {
                 if (string.IsNullOrEmpty(myDocumentsPath)) return "";
                 string docBase = NormalizeLocalAbsolutePath(myDocumentsPath);
-                if (docBase.Length == 0) return "";
-                if (ExistsAndIsReparse(docBase)) return "";
+                if (docBase.Length == 0 || !PathGuard.IsLocalDrivePath(docBase) || !PathGuard.IsFixedLocalDrive(docBase)) return "";
+                if (IsDisallowedSystemOrSelfDir(docBase)) return "";
+                if (PathGuard.HasAnyReparseComponent(docBase)) return "";
                 string docWc = PathGuard.Canonical(Path.Combine(docBase, "WeChat Files"));
-                if (ExistsAndIsReparse(docWc)) return "";
+                if (docWc.Length == 0 || IsDisallowedSystemOrSelfDir(docWc)) return "";
+                if (PathGuard.HasAnyReparseComponent(docWc)) return "";
                 return docWc;
             }
 
             string baseDir = NormalizeLocalAbsolutePath(line);
-            if (baseDir.Length == 0) continue;
-            if (!IsDriveRootPath(baseDir) && ExistsAndIsReparse(baseDir))
+            if (baseDir.Length == 0 || !PathGuard.IsLocalDrivePath(baseDir) || !PathGuard.IsFixedLocalDrive(baseDir)) continue;
+            if (IsDisallowedSystemOrSelfDir(baseDir)) return "";
+            if (PathGuard.HasAnyReparseComponent(baseDir))
                 return "";
 
             string leaf = GetLeafName(baseDir);
             if (string.Equals(leaf, "WeChat Files", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(leaf, "xwechat_files", StringComparison.OrdinalIgnoreCase))
             {
-                return PathGuard.Canonical(baseDir);
+                string canonLeaf = PathGuard.Canonical(baseDir);
+                if (canonLeaf.Length == 0 || IsDisallowedSystemOrSelfDir(canonLeaf)
+                    || IsUserPersonalRootOrAncestor(canonLeaf)
+                    || PathGuard.HasAnyReparseComponent(canonLeaf))
+                    return "";
+                return canonLeaf;
             }
 
             string wcChild = PathGuard.Canonical(Path.Combine(baseDir, "WeChat Files"));
             string xwChild = PathGuard.Canonical(Path.Combine(baseDir, "xwechat_files"));
+            if (wcChild.Length == 0) return "";
+            if (IsDisallowedSystemOrSelfDir(wcChild)) return "";
 
             if (Directory.Exists(wcChild))
             {
-                if (PathGuard.IsReparsePoint(wcChild)) return "";
+                if (PathGuard.HasAnyReparseComponent(wcChild)) return "";
                 return wcChild;
             }
-            if (Directory.Exists(xwChild))
+            if (xwChild.Length > 0 && Directory.Exists(xwChild))
             {
-                if (PathGuard.IsReparsePoint(xwChild)) return "";
+                if (IsDisallowedSystemOrSelfDir(xwChild) || PathGuard.HasAnyReparseComponent(xwChild)) return "";
                 return xwChild;
             }
 
-            if (!IsDriveRootPath(baseDir) && Directory.Exists(baseDir))
+            if (!IsDriveRootPath(baseDir) && !IsUserPersonalRootOrAncestor(baseDir) && Directory.Exists(baseDir))
             {
                 string allUsers = Path.Combine(baseDir, "All Users");
-                if (Directory.Exists(allUsers) && !PathGuard.IsReparsePoint(allUsers))
-                    return PathGuard.Canonical(baseDir);
+                if (Directory.Exists(allUsers) && !PathGuard.HasAnyReparseComponent(allUsers))
+                {
+                    if (HasWeChatRootSignature(baseDir, allUsers))
+                        return PathGuard.Canonical(baseDir);
+                }
             }
 
             return wcChild;
@@ -211,13 +200,13 @@ public static class ChatStorageLocator
         string myDocs = SafeGetMyDocuments();
 
         // 1) 读取微信 3ebffe94.ini 与 xwechat\config\*.ini
-        if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.IsReparsePoint(roaming))
+        if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.HasAnyReparseComponent(roaming))
         {
             string wcIni = Path.Combine(Path.Combine(Path.Combine(Path.Combine(roaming, "Tencent"), "WeChat"), "All Users"), Path.Combine("config", "3ebffe94.ini"));
-            TryProbeWeChatIniFile(list, seen, wcIni, myDocs, "wechat");
+            TryProbeWeChatIniFile(list, seen, roaming, wcIni, myDocs, "wechat");
 
             string xwConfigDir = Path.Combine(Path.Combine(Path.Combine(roaming, "Tencent"), "xwechat"), "config");
-            if (Directory.Exists(xwConfigDir) && !PathGuard.IsReparsePoint(xwConfigDir))
+            if (Directory.Exists(xwConfigDir) && !PathGuard.HasAnyReparseComponent(xwConfigDir))
             {
                 try
                 {
@@ -225,7 +214,7 @@ public static class ChatStorageLocator
                     int limit = Math.Min(iniFiles.Length, MaxConfigIniFiles);
                     for (int i = 0; i < limit; i++)
                     {
-                        TryProbeWeChatIniFile(list, seen, iniFiles[i], myDocs, "xwechat");
+                        TryProbeWeChatIniFile(list, seen, roaming, iniFiles[i], myDocs, "xwechat");
                     }
                 }
                 catch { }
@@ -233,7 +222,7 @@ public static class ChatStorageLocator
         }
 
         // 2) 检查当前用户 Documents 下的默认存储目录
-        if (myDocs.Length > 0 && Directory.Exists(myDocs) && !PathGuard.IsReparsePoint(myDocs))
+        if (myDocs.Length > 0 && Directory.Exists(myDocs) && !PathGuard.HasAnyReparseComponent(myDocs))
         {
             TryAddExistingChatFolder(list, seen, myDocs, Path.Combine(myDocs, "WeChat Files"), "微信", "wechat");
             TryAddExistingChatFolder(list, seen, myDocs, Path.Combine(myDocs, "xwechat_files"), "微信", "xwechat");
@@ -261,14 +250,14 @@ public static class ChatStorageLocator
                 TryAddExistingChatFolder(list, seen, "", Path.Combine(root, "Tencent Files"), "QQ", "qq");
 
                 string wcCustomParent = Path.Combine(root, "WeChat");
-                if (Directory.Exists(wcCustomParent) && !PathGuard.IsReparsePoint(wcCustomParent))
+                if (Directory.Exists(wcCustomParent) && !PathGuard.HasAnyReparseComponent(wcCustomParent))
                 {
                     TryAddExistingChatFolder(list, seen, wcCustomParent, Path.Combine(wcCustomParent, "WeChat Files"), "微信", "wechat");
                     TryAddExistingChatFolder(list, seen, wcCustomParent, Path.Combine(wcCustomParent, "xwechat_files"), "微信", "xwechat");
                 }
 
                 string tencentCustomParent = Path.Combine(root, "Tencent");
-                if (Directory.Exists(tencentCustomParent) && !PathGuard.IsReparsePoint(tencentCustomParent))
+                if (Directory.Exists(tencentCustomParent) && !PathGuard.HasAnyReparseComponent(tencentCustomParent))
                 {
                     TryAddExistingChatFolder(list, seen, tencentCustomParent, Path.Combine(tencentCustomParent, "WeChat Files"), "微信", "wechat");
                     TryAddExistingChatFolder(list, seen, tencentCustomParent, Path.Combine(tencentCustomParent, "xwechat_files"), "微信", "xwechat");
@@ -277,7 +266,7 @@ public static class ChatStorageLocator
                 }
 
                 string qqCustomParent = Path.Combine(root, "QQ");
-                if (Directory.Exists(qqCustomParent) && !PathGuard.IsReparsePoint(qqCustomParent))
+                if (Directory.Exists(qqCustomParent) && !PathGuard.HasAnyReparseComponent(qqCustomParent))
                 {
                     TryAddExistingChatFolder(list, seen, qqCustomParent, Path.Combine(qqCustomParent, "Tencent Files"), "QQ", "qq");
                 }
@@ -285,7 +274,17 @@ public static class ChatStorageLocator
             catch { }
         }
 
-        return list.ToArray();
+        ChatDataFolder[] discovered = list.ToArray();
+        string[] paths = new string[discovered.Length];
+        for (int i = 0; i < discovered.Length; i++)
+        {
+            paths[i] = discovered[i].Path;
+        }
+        lock (discoveredGate)
+        {
+            cachedDiscoveredChatRoots = paths;
+        }
+        return discovered;
     }
 
     /// <summary>
@@ -305,7 +304,7 @@ public static class ChatStorageLocator
             ChatDataFolder f = dataFolders[i];
             if (f == null || string.IsNullOrEmpty(f.Path)) continue;
             string root = PathGuard.Canonical(f.Path);
-            if (root.Length == 0 || !Directory.Exists(root) || PathGuard.IsReparsePoint(root))
+            if (root.Length == 0 || !Directory.Exists(root) || PathGuard.HasAnyReparseComponent(root))
                 continue;
 
             string kind = (f.Kind ?? "").ToLowerInvariant();
@@ -335,14 +334,14 @@ public static class ChatStorageLocator
             string roaming = SafeGetSpecialFolder(Environment.SpecialFolder.ApplicationData);
             string local = SafeGetSpecialFolder(Environment.SpecialFolder.LocalApplicationData);
 
-            if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.IsReparsePoint(roaming))
+            if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.HasAnyReparseComponent(roaming))
             {
                 AddPureCacheDirIfValid(list, seen, roaming,
                     Path.Combine(Path.Combine(roaming, "Tencent"), Path.Combine("WeChat", "XPlugin")),
                     "微信 XPlugin 组件缓存目录（排除可执行模块与用户数据）");
             }
 
-            if (local.Length > 0 && Directory.Exists(local) && !PathGuard.IsReparsePoint(local))
+            if (local.Length > 0 && Directory.Exists(local) && !PathGuard.HasAnyReparseComponent(local))
             {
                 AddPureCacheDirIfValid(list, seen, local,
                     Path.Combine(Path.Combine(local, "Tencent"), Path.Combine("WeChat", "xweb")),
@@ -357,32 +356,95 @@ public static class ChatStorageLocator
     }
 
     /// <summary>
-    /// 是否命中微信/企业微信/QQ 聊天核心数据库（Msg / nt_msg / nt_db 下的 .db / .db-wal / .db-shm / .idx）。
-    /// 供 KEEP-CHATDB 无条件保留保护。
+    /// 是否命中微信/企业微信/QQ 聊天核心数据库（Msg / nt_msg / nt_db / db_storage / nt_data 下的
+    /// .db / .db-wal / .db-shm / .db-journal / .idx，以及 QQ 经典 Msg2.0.db / Msg3.0.db）。
+    /// 供 KEEP-CHATDB 无条件保留保护。纯线性分段匹配，零正则回溯风险。
     /// </summary>
     public static bool IsChatDatabasePath(string fullPath)
     {
         if (string.IsNullOrEmpty(fullPath)) return false;
-        if (StandardChatDbRegex.IsMatch(fullPath)) return true;
-        if (RelativeChatDbSubpathRegex.IsMatch(fullPath) && IsInsideMockChatRoots(fullPath))
+
+        string normalized = NormalizePathForClassification(fullPath);
+        string[] segs = SplitPathSegments(normalized);
+        if (segs.Length < 2) return false;
+
+        string fileName = segs[segs.Length - 1];
+        if (!IsChatDbFileName(fileName)) return false;
+
+        int chatRootIdx = FindStandardChatRootSegmentIndex(segs);
+        bool underKnownChatRoot = chatRootIdx >= 0 || IsInsideMockOrDiscoveredChatRoots(normalized);
+        if (!underKnownChatRoot) return false;
+
+        if (IsClassicQqMsgDbName(fileName))
             return true;
+
+        int startSearch = chatRootIdx >= 0 ? chatRootIdx + 1 : 0;
+        for (int i = startSearch; i < segs.Length - 1; i++)
+        {
+            if (IsChatDbDirSegment(segs[i]))
+                return true;
+        }
         return false;
     }
 
     /// <summary>
     /// 三重硬拦截：路径是否属于聊天核心数据库或用户接收/收藏/表情/聊天图片视频文件。
-    /// 注意：\FileStorage\Sns\Cache\ 为朋友圈纯缓存，不在此黑名单内。
+    /// 注意：\FileStorage\Sns\Cache\ 为朋友圈纯缓存，不在此黑名单内。纯线性分段匹配。
     /// </summary>
     public static bool IsChatProtectedUserContent(string fullPath)
     {
         if (string.IsNullOrEmpty(fullPath)) return false;
         if (IsChatDatabasePath(fullPath)) return true;
-        return ProtectedChatSubpathRegex.IsMatch(fullPath);
+
+        string normalized = NormalizePathForClassification(fullPath);
+        string[] segs = SplitPathSegments(normalized);
+        if (segs.Length == 0) return false;
+
+        int chatRootIdx = FindStandardChatRootSegmentIndex(segs);
+        bool underKnownChatRoot = chatRootIdx >= 0 || IsInsideMockOrDiscoveredChatRoots(normalized);
+        bool underWxWork = HasSegment(segs, "wxwork");
+
+        for (int i = 0; i < segs.Length; i++)
+        {
+            string s = segs[i];
+            if (EqualsSeg(s, "nt_msg") || EqualsSeg(s, "nt_db") || EqualsSeg(s, "db_storage") || EqualsSeg(s, "nt_data")
+                || EqualsSeg(s, "filerecv") || EqualsSeg(s, "mobilefile") || EqualsSeg(s, "customemotion") || EqualsSeg(s, "fav"))
+            {
+                return true;
+            }
+
+            if (underKnownChatRoot && (chatRootIdx < 0 || i > chatRootIdx) && EqualsSeg(s, "msg"))
+            {
+                return true;
+            }
+
+            if (i + 1 < segs.Length)
+            {
+                string next = segs[i + 1];
+                if (EqualsSeg(s, "filestorage")
+                    && (EqualsSeg(next, "file") || EqualsSeg(next, "msgattach") || EqualsSeg(next, "video")
+                        || EqualsSeg(next, "image") || EqualsSeg(next, "customemotion") || EqualsSeg(next, "fav")))
+                {
+                    return true;
+                }
+                if (EqualsSeg(s, "image")
+                    && (EqualsSeg(next, "group") || EqualsSeg(next, "group2") || EqualsSeg(next, "c2c")))
+                {
+                    return true;
+                }
+                if (underWxWork && EqualsSeg(s, "cache")
+                    && (EqualsSeg(next, "file") || EqualsSeg(next, "video")))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// <summary>
     /// 路径是否为微信/企业微信/QQ 聊天接收的独立用户文件（FileStorage\File|Video|MsgAttach、FileRecv、MobileFile），
-    /// 排除聊天数据库文件。供「大文件 -> 聊天接收文件」专向筛选使用。
+    /// 排除聊天数据库文件。供「大文件 -> 聊天接收文件」专向筛选使用。纯线性分段匹配。
     /// </summary>
     public static bool IsChatReceivedUserFile(string fullPath)
     {
@@ -391,29 +453,233 @@ public static class ChatStorageLocator
         if (last == '\\' || last == '/') return false;
         if (IsChatDatabasePath(fullPath)) return false;
 
-        bool underChatRoot = StandardChatRootMarkerRegex.IsMatch(fullPath) || IsInsideMockChatRoots(fullPath);
+        string normalized = NormalizePathForClassification(fullPath);
+        string[] segs = SplitPathSegments(normalized);
+        if (segs.Length < 3) return false;
+
+        int chatRootIdx = FindStandardChatRootSegmentIndex(segs);
+        bool underChatRoot = chatRootIdx >= 0 || IsInsideMockOrDiscoveredChatRoots(normalized);
         if (!underChatRoot) return false;
 
-        return ReceivedUserFileSubpathRegex.IsMatch(fullPath);
+        bool underWxWork = HasSegment(segs, "wxwork");
+        int lastDirIdx = segs.Length - 2; // 最后一段是文件名，至少有一个父目录
+
+        for (int i = 0; i <= lastDirIdx; i++)
+        {
+            string s = segs[i];
+            if (EqualsSeg(s, "filerecv") || EqualsSeg(s, "mobilefile"))
+                return true;
+
+            if (i + 1 <= lastDirIdx)
+            {
+                string next = segs[i + 1];
+                if (EqualsSeg(s, "filestorage")
+                    && (EqualsSeg(next, "file") || EqualsSeg(next, "video") || EqualsSeg(next, "msgattach")))
+                {
+                    return true;
+                }
+                if (underWxWork && EqualsSeg(s, "cache")
+                    && (EqualsSeg(next, "file") || EqualsSeg(next, "video")))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ==================== 内部辅助实现 ====================
 
-    private static bool IsInsideMockChatRoots(string fullPath)
+    private static string NormalizePathForClassification(string raw)
+    {
+        string canon = PathGuard.CanonicalFast(raw);
+        if (canon.Length > 0) return canon;
+        string s = raw.Trim();
+        if (s.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+            return s;
+        if (s.StartsWith("\\\\?\\", StringComparison.Ordinal) || s.StartsWith("\\\\.\\", StringComparison.Ordinal))
+            s = s.Substring(4);
+        return s;
+    }
+
+    private static string[] SplitPathSegments(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return new string[0];
+        return path.Split(new char[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static bool EqualsSeg(string a, string b)
+    {
+        return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasSegment(string[] segs, string target)
+    {
+        for (int i = 0; i < segs.Length; i++)
+        {
+            if (EqualsSeg(segs[i], target)) return true;
+        }
+        return false;
+    }
+
+    private static int FindStandardChatRootSegmentIndex(string[] segs)
+    {
+        for (int i = 0; i < segs.Length; i++)
+        {
+            string s = segs[i];
+            if (EqualsSeg(s, "wechat files")
+                || EqualsSeg(s, "xwechat_files")
+                || EqualsSeg(s, "wxwork")
+                || EqualsSeg(s, "tencent files"))
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static bool IsChatDbDirSegment(string seg)
+    {
+        return EqualsSeg(seg, "msg")
+            || EqualsSeg(seg, "nt_msg")
+            || EqualsSeg(seg, "nt_db")
+            || EqualsSeg(seg, "db_storage")
+            || EqualsSeg(seg, "nt_data");
+    }
+
+    private static bool IsChatDbFileName(string fileName)
+    {
+        if (string.IsNullOrEmpty(fileName)) return false;
+        return fileName.EndsWith(".db", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".db-wal", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".db-shm", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".db-journal", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".idx", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsClassicQqMsgDbName(string fileName)
+    {
+        if (string.IsNullOrEmpty(fileName)) return false;
+        try { return MsgClassicDbNameRegex.IsMatch(fileName); }
+        catch { return true; }
+    }
+
+    private static bool IsInsideMockOrDiscoveredChatRoots(string fullPath)
     {
         ChatDataFolder[] snap;
         lock (mockGate)
         {
             snap = mockChatRoots;
         }
-        if (snap == null || snap.Length == 0) return false;
-        for (int i = 0; i < snap.Length; i++)
+        if (snap != null)
         {
-            ChatDataFolder f = snap[i];
-            if (f == null || string.IsNullOrEmpty(f.Path)) continue;
-            if (PathGuard.IsInside(f.Path, fullPath))
+            for (int i = 0; i < snap.Length; i++)
+            {
+                ChatDataFolder f = snap[i];
+                if (f == null || string.IsNullOrEmpty(f.Path)) continue;
+                if (PathGuard.IsInside(f.Path, fullPath))
+                    return true;
+            }
+            return false;
+        }
+
+        string[] realSnap;
+        lock (discoveredGate)
+        {
+            realSnap = cachedDiscoveredChatRoots;
+        }
+        if (realSnap == null || realSnap.Length == 0) return false;
+        for (int i = 0; i < realSnap.Length; i++)
+        {
+            string r = realSnap[i];
+            if (string.IsNullOrEmpty(r)) continue;
+            if (PathGuard.IsInside(r, fullPath))
                 return true;
         }
+        return false;
+    }
+
+    private static bool IsDisallowedSystemOrSelfDir(string canon)
+    {
+        if (string.IsNullOrEmpty(canon)) return true;
+        string winDir = SafeGetSpecialFolder(Environment.SpecialFolder.Windows);
+        if (winDir.Length > 0 && PathGuard.IsInside(winDir, canon)) return true;
+        string pf = SafeGetSpecialFolder(Environment.SpecialFolder.ProgramFiles);
+        if (pf.Length > 0 && PathGuard.IsInside(pf, canon)) return true;
+        string pf86 = SafeGetSpecialFolder(Environment.SpecialFolder.ProgramFilesX86);
+        if (pf86.Length > 0 && PathGuard.IsInside(pf86, canon)) return true;
+        string progData = SafeGetSpecialFolder(Environment.SpecialFolder.CommonApplicationData);
+        if (progData.Length > 0 && PathGuard.IsInside(progData, canon)) return true;
+
+        try
+        {
+            string baseDir = PathGuard.Canonical(AppDomain.CurrentDomain.BaseDirectory);
+            if (baseDir.Length > 0 && (PathGuard.IsInside(baseDir, canon) || PathGuard.IsInside(canon, baseDir)))
+                return true;
+        }
+        catch { }
+
+        try
+        {
+            string envWv = Environment.GetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER");
+            if (!string.IsNullOrEmpty(envWv))
+            {
+                string canonWv = PathGuard.Canonical(envWv);
+                if (canonWv.Length > 0 && (PathGuard.IsInside(canonWv, canon) || PathGuard.IsInside(canon, canonWv)))
+                    return true;
+            }
+        }
+        catch { }
+
+        return false;
+    }
+
+    private static bool IsUserPersonalRootOrAncestor(string path)
+    {
+        string canon = PathGuard.Canonical(path);
+        if (canon.Length == 0) return true;
+        Environment.SpecialFolder[] protectedFolders = new Environment.SpecialFolder[]
+        {
+            Environment.SpecialFolder.UserProfile,
+            Environment.SpecialFolder.Desktop,
+            Environment.SpecialFolder.MyDocuments,
+            Environment.SpecialFolder.MyPictures,
+            Environment.SpecialFolder.MyVideos
+        };
+        for (int i = 0; i < protectedFolders.Length; i++)
+        {
+            string sp = SafeGetSpecialFolder(protectedFolders[i]);
+            if (sp.Length > 0 && PathGuard.IsInside(canon, sp))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool HasWeChatRootSignature(string baseDir, string allUsersDir)
+    {
+        try
+        {
+            string configData = Path.Combine(Path.Combine(allUsersDir, "config"), "config.data");
+            if (File.Exists(configData) && !PathGuard.HasAnyReparseComponent(configData))
+                return true;
+
+            DirectoryInfo[] children = new DirectoryInfo(baseDir).GetDirectories();
+            int limit = Math.Min(children.Length, MaxAccountDirsPerRoot);
+            for (int i = 0; i < limit; i++)
+            {
+                DirectoryInfo ch = children[i];
+                if ((ch.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                if (!ch.Name.StartsWith("wxid_", StringComparison.OrdinalIgnoreCase)) continue;
+                string msgDir = Path.Combine(ch.FullName, "Msg");
+                string fsDir = Path.Combine(ch.FullName, "FileStorage");
+                if ((Directory.Exists(msgDir) && !PathGuard.HasAnyReparseComponent(msgDir))
+                    || (Directory.Exists(fsDir) && !PathGuard.HasAnyReparseComponent(fsDir)))
+                {
+                    return true;
+                }
+            }
+        }
+        catch { }
         return false;
     }
 
@@ -431,7 +697,7 @@ public static class ChatStorageLocator
             try
             {
                 if (!Directory.Exists(canon)) continue;
-                if (PathGuard.IsReparsePoint(canon)) continue;
+                if (PathGuard.HasAnyReparseComponent(canon)) continue;
             }
             catch { continue; }
 
@@ -473,12 +739,19 @@ public static class ChatStorageLocator
     private static void TryProbeWeChatIniFile(
         List<ChatDataFolder> list,
         HashSet<string> seen,
+        string roamingAnchor,
         string iniPath,
         string myDocs,
         string defaultKind)
     {
         try
         {
+            if (string.IsNullOrEmpty(iniPath)) return;
+            if (!string.IsNullOrEmpty(roamingAnchor) && PathGuard.HasReparseAncestor(roamingAnchor, iniPath))
+                return;
+            if (PathGuard.HasAnyReparseComponent(iniPath))
+                return;
+
             FileInfo fi = new FileInfo(iniPath);
             if (!fi.Exists) return;
             if ((fi.Attributes & FileAttributes.ReparsePoint) != 0) return;
@@ -497,7 +770,7 @@ public static class ChatStorageLocator
             // 若同一自定义父目录下同时存在 xwechat_files，一并探测加入
             string parent = "";
             try { parent = Path.GetDirectoryName(parsed) ?? ""; } catch { parent = ""; }
-            if (parent.Length > 0)
+            if (parent.Length > 0 && !PathGuard.HasAnyReparseComponent(parent))
             {
                 TryAddExistingChatFolder(list, seen, "", Path.Combine(parent, "xwechat_files"), "微信", "xwechat");
                 TryAddExistingChatFolder(list, seen, "", Path.Combine(parent, "WeChat Files"), "微信", "wechat");
@@ -519,10 +792,12 @@ public static class ChatStorageLocator
             if (string.IsNullOrEmpty(candidateDir) || !Directory.Exists(candidateDir)) return;
             string canon = PathGuard.Canonical(candidateDir);
             if (canon.Length == 0 || IsDriveRootPath(canon)) return;
+            if (!PathGuard.IsFixedLocalDrive(canon)) return;
+            if (IsDisallowedSystemOrSelfDir(canon)) return;
             if (!seen.Contains(canon))
             {
                 if (!Directory.Exists(canon)) return;
-                if (PathGuard.IsReparsePoint(canon)) return;
+                if (PathGuard.HasAnyReparseComponent(canon)) return;
                 if (!string.IsNullOrEmpty(anchor) && PathGuard.IsInside(anchor, canon)
                     && PathGuard.HasReparseAncestor(anchor, canon))
                     return;
@@ -667,10 +942,11 @@ public static class ChatStorageLocator
             if (string.IsNullOrEmpty(candidateDir) || !Directory.Exists(candidateDir)) return;
             string canon = PathGuard.Canonical(candidateDir);
             if (canon.Length == 0 || IsDriveRootPath(canon)) return;
+            if (IsDisallowedSystemOrSelfDir(canon)) return;
             if (IsChatProtectedUserContent(canon)) return;
             if (!seen.Add(canon)) return;
             if (!Directory.Exists(canon)) return;
-            if (PathGuard.IsReparsePoint(canon)) return;
+            if (PathGuard.HasAnyReparseComponent(canon)) return;
             if (!string.IsNullOrEmpty(baseAnchor) && PathGuard.IsInside(baseAnchor, canon)
                 && PathGuard.HasReparseAncestor(baseAnchor, canon))
             {
@@ -718,16 +994,17 @@ public static class ChatStorageLocator
         else if (s[2] != '\\' && s[2] != '/')
             return "";
 
-        for (int i = 0; i < s.Length; i++)
+        for (int i = 2; i < s.Length; i++)
         {
             char c = s[i];
-            if (c < 32 || c == '*' || c == '?' || c == '<' || c == '>' || c == '|')
+            if (c < 32 || c == ':' || c == '"' || c == '*' || c == '?' || c == '<' || c == '>' || c == '|')
                 return "";
         }
 
         try
         {
             string full = Path.GetFullPath(s);
+            if (!PathGuard.IsLocalDrivePath(full)) return "";
             string root = Path.GetPathRoot(full);
             if (!string.IsNullOrEmpty(root) && string.Equals(full, root, StringComparison.OrdinalIgnoreCase))
                 return root;
@@ -741,18 +1018,6 @@ public static class ChatStorageLocator
         if (string.IsNullOrEmpty(path)) return false;
         string s = path.TrimEnd('\\', '/');
         return s.Length == 2 && s[1] == ':';
-    }
-
-    private static bool ExistsAndIsReparse(string path)
-    {
-        if (string.IsNullOrEmpty(path)) return false;
-        try
-        {
-            if (!Directory.Exists(path) && !File.Exists(path))
-                return false;
-            return PathGuard.IsReparsePoint(path);
-        }
-        catch { return true; }
     }
 
     private static string GetLeafName(string path)

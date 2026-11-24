@@ -9,6 +9,7 @@ public static class CleanSelection
     {
         rules = null;
         if (msg == null) return "清理分组无效。";
+        if (session <= 0) return "扫描已变化，请重新打开清理清单。";
 
         object sid, kinds;
         if (!msg.TryGetValue("scanSessionId", out sid) || !(sid is int || sid is long) || Convert.ToInt64(sid) != session)
@@ -30,18 +31,37 @@ public static class CleanSelection
             string ruleId = v as string;
             if (string.IsNullOrEmpty(ruleId) || !CacheRuleRegistry.IsCleanableRule(ruleId))
                 return "清理分组无效。";
-            if (seen.Add(ruleId))
-                distinct.Add(ruleId);
+            if (!seen.Add(ruleId))
+                return "清理分组无效。";
+            distinct.Add(ruleId);
         }
 
-        rules = distinct.ToArray();
-
-        for (int i = 0; i < rules.Length; i++)
+        // 有界并严格校验 confirmedRules（若存在），拒绝非字符串、重复、未知规则或超长数组
+        HashSet<string> confirmedSet = null;
+        object confirmedObj;
+        if (msg.TryGetValue("confirmedRules", out confirmedObj) && confirmedObj != null)
         {
-            CacheRuleSpec spec = CacheRuleRegistry.Find(rules[i]);
+            IList confList = confirmedObj as IList;
+            if (confList == null || confList.Count > allSpecs.Length)
+                return "清理分组无效。";
+
+            confirmedSet = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < confList.Count; i++)
+            {
+                string item = confList[i] as string;
+                if (string.IsNullOrEmpty(item) || !CacheRuleRegistry.IsCleanableRule(item))
+                    return "清理分组无效。";
+                if (!confirmedSet.Add(item))
+                    return "清理分组无效。";
+            }
+        }
+
+        for (int i = 0; i < distinct.Count; i++)
+        {
+            CacheRuleSpec spec = CacheRuleRegistry.Find(distinct[i]);
             if (spec == null || !spec.RequiresSeparateConfirm) continue;
 
-            if (!HasSeparateConfirmation(msg, spec.Id))
+            if (!HasSeparateConfirmation(msg, confirmedSet, spec.Id))
             {
                 return !string.IsNullOrEmpty(spec.SeparateConfirmError)
                     ? spec.SeparateConfirmError
@@ -49,29 +69,21 @@ public static class CleanSelection
             }
         }
 
+        rules = distinct.ToArray();
         return null;
     }
 
-    private static bool HasSeparateConfirmation(Dictionary<string, object> msg, string ruleId)
+    private static bool HasSeparateConfirmation(Dictionary<string, object> msg, HashSet<string> confirmedSet, string ruleId)
     {
+        if (confirmedSet != null && confirmedSet.Contains(ruleId))
+            return true;
+
         object confirmDumps;
         if (ruleId == "TMP-CRASHDUMP"
             && msg.TryGetValue("confirmDumps", out confirmDumps)
             && (confirmDumps is bool) && (bool)confirmDumps)
         {
             return true;
-        }
-
-        object confirmedRules;
-        if (msg.TryGetValue("confirmedRules", out confirmedRules) && confirmedRules is IList)
-        {
-            IList list = (IList)confirmedRules;
-            for (int i = 0; i < list.Count; i++)
-            {
-                string item = list[i] as string;
-                if (string.Equals(item, ruleId, StringComparison.Ordinal))
-                    return true;
-            }
         }
 
         return false;

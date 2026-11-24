@@ -15,8 +15,8 @@ using Microsoft.Win32;
 //   —— 它 **不设置** FOF_WANTNUKEWARNING。
 //   而微软对该标志的说明正是「文件被永久销毁而非回收时给出警告」，
 //   即：FOF_ALLOWUNDO 只表示「尽量回收」，不保证一定回收。
-//   当目标放不进回收站（体积超配额、单卷回收站被关闭、可移动/网络磁盘等）时，
-//   Shell 会直接永久删除，且因为 FOF_SILENT|FOF_NOCONFIRMATION 而**不会提示**。
+//   当目标放不进回收站（体积超配额、单卷回收站被关闭、组策略禁用、SUBST 盘、
+//   超长路径、可移动/网络磁盘等）时，Shell 会直接永久删除。
 //
 // 因此这里做两件事：
 //   1) 调用之前：能判定「回收站不可保证」的一律拒绝（绝不尝试永久删除）。
@@ -30,20 +30,15 @@ public static class RecycleBinProbe
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool GetVolumeNameForVolumeMountPointW(string mountPoint, StringBuilder name, uint cch);
 
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern uint QueryDosDeviceW(string deviceName, StringBuilder targetPath, uint ucchMax);
+
     // ---------- 调用之前：能否保证回收 ---------- //
     /// <summary>
     /// 派发前的可用性 / 容量预检（执行契约 v1）。
     ///
     /// 语义必须说清楚：这是**必要而非充分**条件。通过它**不等于**能成功回收。
     /// 本函数只能排除已知的“肯定回收不了”的情形。
-    ///
-    /// v1 相比旧版的变更：
-    ///   * 配额**未知即拒绝**（旧版配额未知时只拦 &gt;1GiB，是 fail-open）；
-    ///   * 体积不完整时拒绝（下界不得当上限用）；
-    ///   * 拒绝理由细分为 kind，供前置拒绝矩阵逐条断言。
-    ///
-    /// 仍未解决的局限：只能用“卷配额总量”比，拿不到回收站**剩余**空间，
-    /// 因此配额足够但回收站已满时仍可能不被回收 —— 这项只能靠事后取证发现。
     /// </summary>
     public static bool IsSupported(string path, long bytes, bool sizeComplete,
                                    out string reason, out DeleteRefusalKind kind)
@@ -51,10 +46,16 @@ public static class RecycleBinProbe
         reason = "";
         kind = DeleteRefusalKind.None;
 
-        // 体积是下界就不允许做容量判断。
+        // 体积是下界或非法负数就不允许做容量判断。
         if (!sizeComplete)
         {
             reason = "给的体积不完整（仅为已知下界），不能用于容量判断";
+            kind = DeleteRefusalKind.DirSizeIncomplete;
+            return false;
+        }
+        if (bytes < 0)
+        {
+            reason = "目标体积无效（负数），不能用于容量判断";
             kind = DeleteRefusalKind.DirSizeIncomplete;
             return false;
         }
@@ -64,6 +65,18 @@ public static class RecycleBinProbe
         {
             kind = DeleteRefusalKind.PathNotCanonical;
             reason = "路径无法解析";
+            return false;
+        }
+        if (!PathGuard.IsLocalDrivePath(canon))
+        {
+            kind = DeleteRefusalKind.VolumeNotSupported;
+            reason = "目标不在本地磁盘路径上（网络位置或扩展设备路径无法保证进入回收站）";
+            return false;
+        }
+        if (canon.Length >= 260)
+        {
+            kind = DeleteRefusalKind.VolumeNotSupported;
+            reason = "目标路径长度达到或超过 260 字符，Shell 回收站无法保证移入";
             return false;
         }
         if (!PathGuard.IsFixedLocalDrive(canon))
@@ -80,6 +93,18 @@ public static class RecycleBinProbe
             reason = "无法确定所属磁盘";
             return false;
         }
+        if (IsSubstOrNonPhysicalDrive(root))
+        {
+            kind = DeleteRefusalKind.VolumeNotSupported;
+            reason = "该盘符为 SUBST 虚拟映射或非物理卷，删除会直接永久删除";
+            return false;
+        }
+        if (QuotaOverrideBytes == 0 && VolumeGuid(root).Length == 0)
+        {
+            kind = DeleteRefusalKind.VolumeNotSupported;
+            reason = "无法识别该磁盘的卷 GUID，无法核实回收站策略，已拒绝";
+            return false;
+        }
 
         string bin = Path.Combine(root, "$Recycle.Bin");
         if (!Directory.Exists(bin))
@@ -92,7 +117,7 @@ public static class RecycleBinProbe
         if (NukeOnDelete(root))
         {
             kind = DeleteRefusalKind.NukeOnDelete;
-            reason = "该磁盘的回收站设置为「不将文件移到回收站」，删除会直接永久删除";
+            reason = "该磁盘或系统策略已禁用回收站（NukeOnDelete / NoRecycleFiles），删除会直接永久删除";
             return false;
         }
 
@@ -116,8 +141,6 @@ public static class RecycleBinProbe
 
     /// <summary>
     /// 旧签名保留（仅供不传完整性的既有调用点），**不应用于新的派发路径**。
-    /// 它把 sizeComplete 当作 true，因此会在界上最保守地放行；
-    /// 新代码请一律用四参数重载。
     /// </summary>
     public static bool IsSupported(string path, long bytes, out string reason)
     {
@@ -125,17 +148,43 @@ public static class RecycleBinProbe
         return IsSupported(path, bytes, true, out reason, out k);
     }
 
+    private static bool IsSubstOrNonPhysicalDrive(string volumeRoot)
+    {
+        try
+        {
+            if (String.IsNullOrEmpty(volumeRoot) || volumeRoot.Length < 2 || volumeRoot[1] != ':')
+                return true;
+            string drive = volumeRoot.Substring(0, 2);
+            StringBuilder sb = new StringBuilder(512);
+            uint ret = QueryDosDeviceW(drive, sb, (uint)sb.Capacity);
+            if (ret == 0) return true;
+            string target = sb.ToString();
+            int nul = target.IndexOf('\0');
+            if (nul >= 0) target = target.Substring(0, nul);
+            if (target.StartsWith(@"\??\", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!target.StartsWith(@"\Device\", StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        catch { return true; }
+    }
+
     private static bool NukeOnDelete(string volumeRoot)
     {
-        // 全局开关
-        object global = ReadValue(@"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket", "NukeOnDelete");
-        if (ToLong(global) == 1) return true;
+        // 组策略 NoRecycleFiles（同时检查 HKLM 与 HKCU，任意非 0 即禁用回收站）
+        const string policyKey = @"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+        if (ToUInt64OrZero(ReadValue(Registry.LocalMachine, policyKey, "NoRecycleFiles")) != 0UL) return true;
+        if (ToUInt64OrZero(ReadValue(Registry.CurrentUser, policyKey, "NoRecycleFiles")) != 0UL) return true;
+
+        // 全局开关（Win32 任意非 0 均视为启用永久删除）
+        object global = ReadValue(Registry.CurrentUser,
+            @"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket", "NukeOnDelete");
+        if (ToUInt64OrZero(global) != 0UL) return true;
 
         string guid = VolumeGuid(volumeRoot);
-        if (guid.Length == 0) return false;      // 读不到就交给事后取证兜底
-        object perVol = ReadValue(
+        if (guid.Length == 0) return QuotaOverrideBytes == 0;  // 无法取到卷 GUID 时 fail-closed
+        object perVol = ReadValue(Registry.CurrentUser,
             @"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\" + guid, "NukeOnDelete");
-        return ToLong(perVol) == 1;
+        return ToUInt64OrZero(perVol) != 0UL;
     }
 
     /// <summary>
@@ -155,19 +204,19 @@ public static class RecycleBinProbe
         long mb = 0;
         string guid = VolumeGuid(volumeRoot);
         if (guid.Length > 0)
-            mb = ToLong(ReadValue(
+            mb = ToLong(ReadValue(Registry.CurrentUser,
                 @"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\" + guid, "MaxCapacity"));
         if (mb <= 0)
-            mb = ToLong(ReadValue(@"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket", "MaxCapacity"));
+            mb = ToLong(ReadValue(Registry.CurrentUser,
+                @"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket", "MaxCapacity"));
         if (mb <= 0) return 0;
+        if (mb > (long.MaxValue / (1024L * 1024L))) return long.MaxValue;
         return mb * 1024L * 1024L;
     }
 
     /// <summary>
     /// 把 "\\?\Volume{guid}\" 转成注册表键名 "{guid}"。
-    /// 注意：BitBucket\Volume 下的子键名只有花括号部分，**不含** "Volume" 前缀；
-    /// 早期版本拼成 "Volume{guid}" 导致 NukeOnDelete / MaxCapacity 永远查不到，
-    /// 安全检查会静默失效。已改为可测函数并有回归用例。
+    /// 注意：BitBucket\Volume 下的子键名只有花括号部分，**不含** "Volume" 前缀。
     /// </summary>
     public static string VolumeKeyName(string volumeRoot)
     {
@@ -192,11 +241,12 @@ public static class RecycleBinProbe
         return VolumeKeyName(volumeRoot);
     }
 
-    private static object ReadValue(string subKey, string name)
+    private static object ReadValue(RegistryKey hive, string subKey, string name)
     {
         try
         {
-            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(subKey, false))
+            if (hive == null) return null;
+            using (RegistryKey k = hive.OpenSubKey(subKey, false))
             {
                 if (k == null) return null;
                 return k.GetValue(name);
@@ -205,10 +255,40 @@ public static class RecycleBinProbe
         catch { return null; }
     }
 
+    private static ulong ToUInt64OrZero(object o)
+    {
+        if (o == null) return 0UL;
+        try
+        {
+            if (o is int) return (ulong)(uint)(int)o;
+            if (o is uint) return (ulong)(uint)o;
+            if (o is long) return unchecked((ulong)(long)o);
+            if (o is ulong) return (ulong)o;
+            if (o is short) return (ulong)(ushort)(short)o;
+            if (o is ushort) return (ulong)(ushort)o;
+            if (o is byte) return (ulong)(byte)o;
+            if (o is byte[])
+            {
+                byte[] arr = (byte[])o;
+                if (arr.Length >= 8) return BitConverter.ToUInt64(arr, 0);
+                if (arr.Length >= 4) return (ulong)BitConverter.ToUInt32(arr, 0);
+                if (arr.Length >= 1) return (ulong)arr[0];
+                return 0UL;
+            }
+            return Convert.ToUInt64(o);
+        }
+        catch { return 0UL; }
+    }
+
     private static long ToLong(object o)
     {
         if (o == null) return 0;
-        try { return Convert.ToInt64(o); }
+        try
+        {
+            if (o is int) return (long)(uint)(int)o;
+            if (o is uint) return (long)(uint)o;
+            return Convert.ToInt64(o);
+        }
         catch { return 0; }
     }
 
@@ -229,9 +309,7 @@ public static class RecycleBinProbe
     /// 必须同时匹配三件事，否则不得作为证据：
     ///   1) 原路径；
     ///   2) 体积（目录可用负数跳过）；
-    ///   3) 删除时间晚于本次调用发起之前若干秒。
-    /// 原因（实测）：E: 盘存在 464 个 $I 元数据但只有 1 个 $R 内容项，
-    /// 即大量陈旧元数据残留；只看路径会把历史记录当成新删除的证据。
+    ///   3) 有效的删除时间且晚于本次调用发起之前若干秒。
     /// </summary>
     public static bool Confirm(string path, long expectedBytes, DateTime notBeforeUtc,
                                out string evidence, out bool inconclusive)
@@ -268,8 +346,8 @@ public static class RecycleBinProbe
                 if (!string.Equals(PathGuard.Canonical(e.OriginalPath), canon, StringComparison.OrdinalIgnoreCase))
                     continue;
                 if (expectedBytes >= 0 && e.Size != expectedBytes) continue;          // 体积不符 → 可能不是本次
-                if (e.DeletedUtc != DateTime.MinValue
-                    && e.DeletedUtc < notBeforeUtc.AddSeconds(-5)) continue;           // 太旧 → 陈旧记录
+                if (e.DeletedUtc == DateTime.MinValue
+                    || e.DeletedUtc < notBeforeUtc.AddSeconds(-5)) continue;           // 无效时间或太旧 → 拒绝
 
                 // $R 内容项与 $I 同目录同名尾
                 string payload = Path.Combine(Path.GetDirectoryName(m),
@@ -294,6 +372,7 @@ public static class RecycleBinProbe
     public static BinEntry ParseMetadata(string file)
     {
         byte[] b;
+        int read = 0;
         try
         {
             FileInfo fi = new FileInfo(file);
@@ -302,7 +381,6 @@ public static class RecycleBinProbe
             b = new byte[len];
             using (FileStream fs = File.OpenRead(file))
             {
-                int read = 0;
                 while (read < len)
                 {
                     int n = fs.Read(b, read, len - read);
@@ -310,7 +388,7 @@ public static class RecycleBinProbe
                     read += n;
                 }
             }
-            if (b.Length < 24) return null;
+            if (read < 24) return null;
         }
         catch { return null; }
 
@@ -324,19 +402,19 @@ public static class RecycleBinProbe
         string path = "";
         if (version >= 2)
         {
-            if (b.Length >= 28)
+            if (read >= 28)
             {
                 int chars = BitConverter.ToInt32(b, 24);
                 if (chars > 0)
                 {
-                    int avail = Math.Min(chars, (b.Length - 28) / 2);
+                    int avail = Math.Min(chars, (read - 28) / 2);
                     if (avail > 0) path = Encoding.Unicode.GetString(b, 28, avail * 2);
                 }
             }
         }
         else
         {
-            int avail = Math.Min(260, (b.Length - 24) / 2);
+            int avail = Math.Min(260, (read - 24) / 2);
             if (avail > 0) path = Encoding.Unicode.GetString(b, 24, avail * 2);
         }
 

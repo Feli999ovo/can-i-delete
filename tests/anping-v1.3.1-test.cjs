@@ -63,4 +63,18 @@ assert(css.includes('::-webkit-scrollbar-button') && /display:\s*none/.test(css)
 // 7. Coverage directory count note (B5)
 assert(script.includes('含起始目录'), 'coverage directory count must clarify inclusion of root directory');
 
+// 8. Frontend security hardening (UI-01, UI-02)
+assert(!script.includes('__auditEval'), 'production ui/app.js must not define __auditEval backdoor');
+assert(!/\beval\s*\(/.test(script), 'production ui/app.js must not call eval()');
+const cspMatch = html.match(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/i);
+assert(cspMatch, 'ui/index.html must define a Content-Security-Policy meta tag');
+const csp = cspMatch[1];
+assert(csp.includes("script-src 'self'"), 'CSP must enforce script-src self');
+assert(csp.includes("style-src 'self'"), 'CSP must enforce style-src self');
+assert(!csp.includes("'unsafe-eval'"), 'CSP must not allow unsafe-eval');
+assert(!csp.includes("'unsafe-inline'"), 'CSP must not allow unsafe-inline');
+assert(csp.includes("connect-src 'none'") && csp.includes("object-src 'none'"), 'CSP must block network connect and objects');
+assert(/<meta\s+name="referrer"\s+content="no-referrer"/i.test(html), 'ui/index.html must set no-referrer policy');
+assert(!/\bstyle="/.test(html) && !/\bstyle="/.test(script), 'ui/index.html and ui/app.js must not rely on inline style attributes');
+
 console.log('PASS all v1.3.1 + v0.7 modular specification checks');

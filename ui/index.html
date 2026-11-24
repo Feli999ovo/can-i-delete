@@ -2,6 +2,8 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none';" />
+<meta name="referrer" content="no-referrer" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>按平 · 白瓷清理（can-i-delete）</title>
 <link rel="stylesheet" href="styles.css">
@@ -131,7 +133,7 @@
       <div class="leg"><span class="sw review"></span><span><b>◐ 细刻纹</b> 需复核：规则不确定，请你看一眼</span></div>
       <div class="leg"><span class="sw keep"></span><span><b>○ 哑光带锁</b> 建议保留：按平不会清理</span></div>
       <div class="leg"><span class="g">↗</span>点击柱子，查看里面的每个文件、完整路径和判断依据。</div>
-      <div style="text-align:right;margin-top:6px"><button class="sbtn" id="legendOk" type="button">知道了</button></div>
+      <div class="pop-foot"><button class="sbtn" id="legendOk" type="button">知道了</button></div>
     </div>
     <div class="tip" id="tip"></div>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

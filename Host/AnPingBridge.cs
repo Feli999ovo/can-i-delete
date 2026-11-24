@@ -5,9 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
+using Microsoft.Win32.SafeHandles;
 using Microsoft.Web.WebView2.WinForms;
 using Microsoft.Web.WebView2.Core;
 
@@ -15,7 +17,12 @@ public sealed class AnPingBridge : IDisposable
 {
     private readonly Form hostForm;
     private readonly WebView2 webView;
-    private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
+    private readonly JavaScriptSerializer inboundSerializer = new JavaScriptSerializer();
+    private readonly JavaScriptSerializer outboundSerializer = new JavaScriptSerializer();
+    private readonly object outboundSerLock = new object();
+    private readonly object diagnosticLock = new object();
+    private readonly ManualResetEventSlim activeFileOpDone = new ManualResetEventSlim(true);
+    private int inFlightFileTech;
     private readonly ScanSessionHost session = new ScanSessionHost();
     private readonly ScanBudget scanBudget;
     private readonly List<ListRow> allRows = new List<ListRow>();
@@ -58,6 +65,52 @@ public sealed class AnPingBridge : IDisposable
     private Action<string> messageCaptureForTest;
     private RelaunchAdminDelegate relaunchHandlerForTest;
 
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint OPEN_ALWAYS = 4;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_ATTR_DIRECTORY = 0x00000010;
+    private const uint FILE_ATTR_REPARSE_POINT = 0x00000400;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME CreationTime;
+        public FILETIME LastAccessTime;
+        public FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr ILCreateFromPathW(string pszPath);
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern void ILFree(IntPtr pidl);
+
+    [DllImport("shell32.dll", ExactSpelling = true)]
+    private static extern int SHOpenFolderAndSelectItems(IntPtr pidlFolder, uint cidl, IntPtr apidl, uint dwFlags);
+
     [DllImport("user32.dll")]
     private static extern bool ReleaseCapture();
 
@@ -71,10 +124,23 @@ public sealed class AnPingBridge : IDisposable
     {
         hostForm = form;
         webView = wv;
-        serializer.MaxJsonLength = 64 * 1024 * 1024;
+        inboundSerializer.MaxJsonLength = 256 * 1024;
+        inboundSerializer.RecursionLimit = 16;
+        outboundSerializer.MaxJsonLength = 64 * 1024 * 1024;
 
-        scanBudget = ScanSessionHost.BudgetFromEnvironment(
-            Environment.GetEnvironmentVariable("CANIDELETE_SCAN_LIMITS"));
+        ScanBudget budget = null;
+        try
+        {
+            string envLimits = Program.IsCurrentProcessAdmin()
+                ? null
+                : Environment.GetEnvironmentVariable("CANIDELETE_SCAN_LIMITS");
+            budget = ScanSessionHost.BudgetFromEnvironment(envLimits);
+        }
+        catch
+        {
+            budget = ScanSessionHost.BudgetFromEnvironment(null);
+        }
+        scanBudget = budget ?? ScanSessionHost.BudgetFromEnvironment(null);
         scanBudget.Recursive = true;
         ResetLiveAccumulators();
 
@@ -121,11 +187,65 @@ public sealed class AnPingBridge : IDisposable
         OnProgressTick(this, EventArgs.Empty);
     }
 
+    private static bool TryGetInt32(Dictionary<string, object> msg, string key, out int value)
+    {
+        value = 0;
+        object raw;
+        if (msg == null || !msg.TryGetValue(key, out raw) || raw == null) return false;
+        if (raw is int) { value = (int)raw; return true; }
+        if (raw is long)
+        {
+            long l = (long)raw;
+            if (l >= int.MinValue && l <= int.MaxValue) { value = (int)l; return true; }
+        }
+        return false;
+    }
+
+    private static bool TryGetInt64(Dictionary<string, object> msg, string key, out long value)
+    {
+        value = 0L;
+        object raw;
+        if (msg == null || !msg.TryGetValue(key, out raw) || raw == null) return false;
+        if (raw is int) { value = (int)raw; return true; }
+        if (raw is long) { value = (long)raw; return true; }
+        return false;
+    }
+
+    private static void HandleJsLog(Dictionary<string, object> msg)
+    {
+        object lvlObj;
+        string rawLevel = msg.TryGetValue("level", out lvlObj) && lvlObj != null
+            ? (Convert.ToString(lvlObj) ?? "").Trim().ToLowerInvariant()
+            : "info";
+        string level = (rawLevel == "info" || rawLevel == "warn" || rawLevel == "error" || rawLevel == "fatal")
+            ? rawLevel : "info";
+
+        object msgObj;
+        string rawMsg = msg.TryGetValue("msg", out msgObj) && msgObj != null
+            ? (Convert.ToString(msgObj) ?? "")
+            : "";
+        StringBuilder clean = new StringBuilder(Math.Min(rawMsg.Length, 512));
+        for (int i = 0; i < rawMsg.Length && clean.Length < 512; i++)
+        {
+            char ch = rawMsg[i];
+            if (ch >= 0x20 && ch != 0x7F)
+            {
+                clean.Append(ch);
+            }
+            else if (ch == '\t' || ch == '\r' || ch == '\n')
+            {
+                clean.Append(' ');
+            }
+        }
+        Console.WriteLine("[JS " + level + "] " + clean.ToString());
+    }
+
     public void HandleWebMessage(string json)
     {
+        if (closingOrDisposed || isClosingGracefully) return;
         try
         {
-            Dictionary<string, object> msg = serializer.Deserialize<Dictionary<string, object>>(json);
+            Dictionary<string, object> msg = inboundSerializer.Deserialize<Dictionary<string, object>>(json);
             if (msg == null || !msg.ContainsKey("action")) return;
 
             string action = Convert.ToString(msg["action"]);
@@ -148,7 +268,7 @@ public sealed class AnPingBridge : IDisposable
                     break;
 
                 case "log":
-                    Console.WriteLine("[JS " + Convert.ToString(msg["level"]) + "] " + Convert.ToString(msg["msg"]));
+                    HandleJsLog(msg);
                     break;
 
                 case "getDrives":
@@ -227,18 +347,26 @@ public sealed class AnPingBridge : IDisposable
                     break;
 
                 case "revealFile":
-                    if (msg.ContainsKey("id"))
+                    int revealId;
+                    if (TryGetInt32(msg, "id", out revealId) && revealId >= 0)
                     {
-                        int id = Convert.ToInt32(msg["id"]);
-                        RevealFileById(id);
+                        RevealFileById(revealId);
+                    }
+                    else
+                    {
+                        PostMessage(new { action = "fileActionResult", op = "reveal", id = -1, success = false, error = "无效的文件标识。" });
                     }
                     break;
 
                 case "copyPath":
-                    if (msg.ContainsKey("id"))
+                    int copyId;
+                    if (TryGetInt32(msg, "id", out copyId) && copyId >= 0)
                     {
-                        int id = Convert.ToInt32(msg["id"]);
-                        CopyPathById(id);
+                        CopyPathById(copyId);
+                    }
+                    else
+                    {
+                        PostMessage(new { action = "fileActionResult", op = "copy", id = -1, success = false, error = "无效的文件标识。" });
                     }
                     break;
 
@@ -607,10 +735,16 @@ public sealed class AnPingBridge : IDisposable
             PostMessage(new { action = "scanRejected", error = "每次请选择一个扫描位置。" });
             return;
         }
+        string rawTarget = targets[0] == null ? "" : targets[0].Trim();
+        if (!PathGuard.IsLocalDrivePath(rawTarget))
+        {
+            PostMessage(new { action = "scanRejected", error = "仅支持扫描本地磁盘路径，不支持网络共享或设备路径。" });
+            return;
+        }
 
         CacheRuleRegistry.RefreshRootsCache();
         string why;
-        if (!session.Start(targets[0], scanBudget, out why))
+        if (!session.Start(rawTarget, scanBudget, out why))
         {
             PostMessage(new { action = "scanRejected", error = why });
             return;
@@ -1316,28 +1450,49 @@ public sealed class AnPingBridge : IDisposable
     private bool ValidSnapshot(Dictionary<string, object> msg)
     {
         object value;
-        return !msg.TryGetValue("snapshot", out value) || (value is int && ((int)value == 0 || (detailSnapshot != null && (int)value == snapshotVersion)));
+        if (!msg.TryGetValue("snapshot", out value)) return true;
+        int snap;
+        if (!TryGetInt32(msg, "snapshot", out snap)) return false;
+        return snap == 0 || (detailSnapshot != null && snap == snapshotVersion);
     }
 
     private void SendFilesPage(Dictionary<string, object> msg)
     {
-        int request = msg.ContainsKey("request") && msg["request"] is int ? (int)msg["request"] : -1;
-        int offset = msg.ContainsKey("offset") && msg["offset"] is int ? (int)msg["offset"] : -1;
+        int request;
+        if (!TryGetInt32(msg, "request", out request)) request = -1;
+        int offset;
+        if (!TryGetInt32(msg, "offset", out offset)) offset = -1;
         if (!ValidSnapshot(msg))
         {
             PostMessage(new { action = "filesPage", request = msg.ContainsKey("request") ? msg["request"] : null, error = "快照已失效，请重新打开。" });
             return;
         }
-        string filter = msg.ContainsKey("filter") ? Convert.ToString(msg["filter"]) : "";
-        string sort = msg.ContainsKey("sort") ? Convert.ToString(msg["sort"]) : "";
-        string query = msg.ContainsKey("query") ? Convert.ToString(msg["query"]) : "";
-        string group = msg.ContainsKey("group") ? Convert.ToString(msg["group"]) : "";
-        var raw = msg.ContainsKey("categories") ? msg["categories"] as System.Collections.ArrayList : null;
-        string[] cats = raw == null ? new string[0] : raw.Cast<object>().Select(delegate(object v) { return Convert.ToString(v); }).ToArray();
-        string[] allowed = GetCategoryDefinitions().Select(delegate(KeyValuePair<string, string> kv) { return kv.Key; }).ToArray();
 
-        if (request < 0 || offset < 0 || offset > allRows.Count || cats.Length == 0 || cats.Length > allowed.Length
-            || cats.Distinct().Count() != cats.Length || cats.Any(delegate(string c) { return !allowed.Contains(c); })
+        int version = 0;
+        if (msg.ContainsKey("snapshot"))
+        {
+            if (!TryGetInt32(msg, "snapshot", out version))
+            {
+                PostMessage(new { action = "filesPage", request = request, error = "无效的明细参数" });
+                return;
+            }
+        }
+        if (version != 0 && (version != snapshotVersion || detailSnapshot == null))
+        {
+            PostMessage(new { action = "filesPage", request = request, error = "明细快照已过期，请重新打开。" });
+            return;
+        }
+
+        var source = version == 0 ? allRows : detailSnapshot;
+        string filter = msg.ContainsKey("filter") ? (Convert.ToString(msg["filter"]) ?? "") : "";
+        string sort = msg.ContainsKey("sort") ? (Convert.ToString(msg["sort"]) ?? "") : "";
+        string query = msg.ContainsKey("query") ? (Convert.ToString(msg["query"]) ?? "") : "";
+        string group = msg.ContainsKey("group") ? (Convert.ToString(msg["group"]) ?? "") : "";
+        string[] allowed = GetCategoryDefinitions().Select(delegate(KeyValuePair<string, string> kv) { return kv.Key; }).ToArray();
+        var raw = msg.ContainsKey("categories") ? msg["categories"] as System.Collections.ArrayList : null;
+
+        if (request < 0 || offset < 0 || source == null || offset > source.Count
+            || raw == null || raw.Count == 0 || raw.Count > allowed.Length
             || query.Length > 200 || group.Length > 32768
             || !new[] { "all", "ok", "review", "keep" }.Contains(filter) || (sort != "size" && sort != "name"))
         {
@@ -1345,15 +1500,14 @@ public sealed class AnPingBridge : IDisposable
             return;
         }
 
-        int version = msg.ContainsKey("snapshot") && msg["snapshot"] is int ? (int)msg["snapshot"] : 0;
-        if (version != 0 && (version != snapshotVersion || detailSnapshot == null))
+        string[] cats = raw.Cast<object>().Select(delegate(object v) { return Convert.ToString(v) ?? ""; }).ToArray();
+        if (cats.Distinct().Count() != cats.Length || cats.Any(delegate(string c) { return !allowed.Contains(c); }))
         {
-            PostMessage(new { action = "filesPage", request = request, error = "明细快照已过期，请重新打开。" });
+            PostMessage(new { action = "filesPage", request = request, error = "无效的明细参数" });
             return;
         }
 
         var catSet = new HashSet<string>(cats, StringComparer.Ordinal);
-        var source = version == 0 ? allRows : detailSnapshot;
         var rows = new List<ListRow>();
         for (int i = 0; i < source.Count; i++)
         {
@@ -1413,10 +1567,12 @@ public sealed class AnPingBridge : IDisposable
 
     private void SendReviewGroups(Dictionary<string, object> msg)
     {
-        int version = msg.ContainsKey("snapshot") && msg["snapshot"] is int ? (int)msg["snapshot"] : 0;
+        int version = 0;
+        bool snapOk = !msg.ContainsKey("snapshot") || TryGetInt32(msg, "snapshot", out version);
         var source = version == 0 ? allRows : detailSnapshot;
-        int offset = msg.ContainsKey("offset") && msg["offset"] is int ? (int)msg["offset"] : 0;
-        if (!ValidSnapshot(msg) || source == null || offset < 0 || offset > source.Count)
+        int offset = 0;
+        bool offsetOk = !msg.ContainsKey("offset") || TryGetInt32(msg, "offset", out offset);
+        if (!snapOk || !offsetOk || !ValidSnapshot(msg) || source == null || offset < 0 || offset > source.Count)
         {
             PostMessage(new { action = "reviewGroups", request = msg.ContainsKey("request") ? msg["request"] : null, error = "分组快照已失效，请重新打开。" });
             return;
@@ -1462,11 +1618,14 @@ public sealed class AnPingBridge : IDisposable
 
     private void SendDirectoriesPage(Dictionary<string, object> msg)
     {
-        int request = msg.ContainsKey("request") && msg["request"] is int ? (int)msg["request"] : -1;
-        int directoryId = msg.ContainsKey("directoryId") && msg["directoryId"] is int ? (int)msg["directoryId"] : -1;
-        int offset = msg.ContainsKey("offset") && msg["offset"] is int ? (int)msg["offset"] : -1;
-        object sid;
-        long sessionId = msg.TryGetValue("scanSessionId", out sid) && (sid is int || sid is long) ? Convert.ToInt64(sid) : -1L;
+        int request;
+        if (!TryGetInt32(msg, "request", out request)) request = -1;
+        int directoryId;
+        if (!TryGetInt32(msg, "directoryId", out directoryId)) directoryId = -1;
+        int offset;
+        if (!TryGetInt32(msg, "offset", out offset)) offset = -1;
+        long sessionId;
+        if (!TryGetInt64(msg, "scanSessionId", out sessionId)) sessionId = -1L;
 
         if (request < 0 || directoryId < 0 || offset < 0 || sessionId < 0 || sessionId != scanSessionId || directorySummary == null)
         {
@@ -1537,9 +1696,10 @@ public sealed class AnPingBridge : IDisposable
 
     private void SendLargeFiles(Dictionary<string, object> msg)
     {
-        int request = msg.ContainsKey("request") && (msg["request"] is int || msg["request"] is long) ? Convert.ToInt32(msg["request"]) : -1;
-        object sid;
-        long sessionId = msg.TryGetValue("scanSessionId", out sid) && (sid is int || sid is long) ? Convert.ToInt64(sid) : -1L;
+        int request;
+        if (!TryGetInt32(msg, "request", out request)) request = -1;
+        long sessionId;
+        if (!TryGetInt64(msg, "scanSessionId", out sessionId)) sessionId = -1L;
         if (request < 0 || sessionId < 0 || sessionId != scanSessionId)
         {
             PostMessage(new { action = "largeFilesPage", request = request, scanSessionId = scanSessionId, error = "无效的大文件查询参数或会话不匹配" });
@@ -1547,10 +1707,10 @@ public sealed class AnPingBridge : IDisposable
         }
 
         int limit = 100;
-        object limObj;
-        if (msg.TryGetValue("limit", out limObj) && (limObj is int || limObj is long))
+        int parsedLimit;
+        if (TryGetInt32(msg, "limit", out parsedLimit))
         {
-            limit = Convert.ToInt32(limObj);
+            limit = parsedLimit;
         }
         if (limit < 1) limit = 1;
         if (limit > 200) limit = 200;
@@ -1674,8 +1834,31 @@ public sealed class AnPingBridge : IDisposable
 
     private void SendFileTech(Dictionary<string, object> msg)
     {
-        int request = msg.ContainsKey("request") && (msg["request"] is int || msg["request"] is long) ? Convert.ToInt32(msg["request"]) : -1;
-        int id = msg.ContainsKey("id") && (msg["id"] is int || msg["id"] is long) ? Convert.ToInt32(msg["id"]) : -1;
+        int request;
+        if (!TryGetInt32(msg, "request", out request)) request = -1;
+        int id;
+        if (!TryGetInt32(msg, "id", out id)) id = -1;
+
+        object sidObj;
+        if (msg.TryGetValue("scanSessionId", out sidObj))
+        {
+            long reqSid;
+            if (!TryGetInt64(msg, "scanSessionId", out reqSid) || reqSid != scanSessionId)
+            {
+                PostMessage(new
+                {
+                    action = "fileTechResult",
+                    request = request,
+                    id = id,
+                    created = "无法读取",
+                    accessed = "无法读取",
+                    attributes = "无法读取",
+                    process = "无法读取"
+                });
+                return;
+            }
+        }
+
         ListRow r;
         if (id < 0 || !idMap.TryGetValue(id, out r) || r == null || string.IsNullOrEmpty(r.Path))
         {
@@ -1692,21 +1875,68 @@ public sealed class AnPingBridge : IDisposable
             return;
         }
 
-        string targetPath = r.Path;
-        ThreadPool.QueueUserWorkItem(delegate(object state)
+        if (Interlocked.Increment(ref inFlightFileTech) > 4)
         {
-            FileTechInfo info = FileDetailProbe.Inspect(targetPath);
+            Interlocked.Decrement(ref inFlightFileTech);
             PostMessage(new
             {
                 action = "fileTechResult",
                 request = request,
                 id = id,
-                created = info.Created,
-                accessed = info.Accessed,
-                attributes = info.Attributes,
-                process = info.Process
+                created = "繁忙，请稍候",
+                accessed = "繁忙，请稍候",
+                attributes = "繁忙，请稍候",
+                process = "繁忙，请稍候"
             });
-        });
+            return;
+        }
+
+        string targetPath = r.Path;
+        bool queued = false;
+        try
+        {
+            queued = ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                try
+                {
+                    if (closingOrDisposed) return;
+                    FileTechInfo info = FileDetailProbe.Inspect(targetPath);
+                    if (closingOrDisposed) return;
+                    PostMessage(new
+                    {
+                        action = "fileTechResult",
+                        request = request,
+                        id = id,
+                        created = info.Created,
+                        accessed = info.Accessed,
+                        attributes = info.Attributes,
+                        process = info.Process
+                    });
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref inFlightFileTech);
+                }
+            });
+        }
+        catch
+        {
+            queued = false;
+        }
+        if (!queued)
+        {
+            Interlocked.Decrement(ref inFlightFileTech);
+            PostMessage(new
+            {
+                action = "fileTechResult",
+                request = request,
+                id = id,
+                created = "繁忙，请稍候",
+                accessed = "繁忙，请稍候",
+                attributes = "繁忙，请稍候",
+                process = "繁忙，请稍候"
+            });
+        }
     }
 
     private string MapRuleToCategory(string ruleId)
@@ -1719,19 +1949,58 @@ public sealed class AnPingBridge : IDisposable
         ListRow r;
         bool success = false;
         string error = "扫描结果已失效，请重新扫描。";
-        string fileName, arguments, why;
-        if (idMap.TryGetValue(id, out r))
+        if (idMap.TryGetValue(id, out r) && r != null)
         {
-            if (Program.TryBuildRevealCommand(r.Path, out fileName, out arguments, out why))
+            string canonPath, why;
+            if (Program.TryValidateLocalRevealPath(r.Path, out canonPath, out why))
             {
+                IntPtr pidl = IntPtr.Zero;
                 try
                 {
-                    System.Diagnostics.Process.Start(Program.BuildRevealStartInfo(fileName, arguments));
-                    success = true;
+                    pidl = ILCreateFromPathW(canonPath);
+                    if (pidl != IntPtr.Zero)
+                    {
+                        int hr = SHOpenFolderAndSelectItems(pidl, 0, IntPtr.Zero, 0);
+                        if (hr == 0)
+                        {
+                            success = true;
+                        }
+                    }
                 }
-                catch (Exception ex) { error = "无法打开资源管理器：" + ex.Message; }
+                catch { }
+                finally
+                {
+                    if (pidl != IntPtr.Zero)
+                    {
+                        try { ILFree(pidl); } catch { }
+                    }
+                }
+
+                if (!success)
+                {
+                    string fileName, arguments, cmdWhy;
+                    if (Program.TryBuildRevealCommand(canonPath, out fileName, out arguments, out cmdWhy))
+                    {
+                        try
+                        {
+                            using (Process proc = Process.Start(Program.BuildRevealStartInfo(fileName, arguments)))
+                            {
+                                success = proc != null;
+                                if (!success) error = "无法打开资源管理器。";
+                            }
+                        }
+                        catch (Exception ex) { error = "无法打开资源管理器：" + ex.Message; }
+                    }
+                    else
+                    {
+                        error = cmdWhy;
+                    }
+                }
             }
-            else error = why;
+            else
+            {
+                error = why;
+            }
         }
         PostMessage(new { action = "fileActionResult", op = "reveal", id = id, success = success, error = success ? "" : error });
     }
@@ -1751,20 +2020,100 @@ public sealed class AnPingBridge : IDisposable
 
     private void WriteDiagnostic(string action, string stage, Exception error)
     {
-        if (diagnosticCount++ >= 32) return;
-        try
+        if (Interlocked.Increment(ref diagnosticCount) > 32) return;
+        lock (diagnosticLock)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(diagnosticFile));
-            if (File.Exists(diagnosticFile) && new FileInfo(diagnosticFile).Length > 16384) File.WriteAllText(diagnosticFile, "bounded log restarted\n");
-            File.AppendAllText(diagnosticFile, DateTime.UtcNow.ToString("o") + " action=" + action + " stage=" + stage + " session=" + scanSessionId + " error=" + (error == null ? "Unavailable" : error.GetType().Name + "/" + error.HResult.ToString("X")) + Environment.NewLine);
+            IntPtr h = IntPtr.Zero;
+            try
+            {
+                string dir = Path.GetDirectoryName(diagnosticFile);
+                if (string.IsNullOrEmpty(dir)
+                    || !PathGuard.IsLocalDrivePath(dir)
+                    || !PathGuard.IsLocalDrivePath(diagnosticFile))
+                {
+                    return;
+                }
+
+                string parentDir = Path.GetDirectoryName(dir.TrimEnd('\\', '/'));
+                if (string.IsNullOrEmpty(parentDir) || PathGuard.HasAnyReparseComponent(parentDir)) return;
+
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                if (PathGuard.HasAnyReparseComponent(dir)) return;
+
+                try
+                {
+                    FileAttributes preAttr = File.GetAttributes(diagnosticFile);
+                    if ((preAttr & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0) return;
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+
+                h = CreateFileW(diagnosticFile, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, IntPtr.Zero,
+                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                if (h == IntPtr.Zero || h == new IntPtr(-1))
+                {
+                    h = IntPtr.Zero;
+                    return;
+                }
+
+                BY_HANDLE_FILE_INFORMATION info;
+                if (!GetFileInformationByHandle(h, out info)) return;
+                if ((info.FileAttributes & FILE_ATTR_REPARSE_POINT) != 0) return;
+                if ((info.FileAttributes & FILE_ATTR_DIRECTORY) != 0) return;
+                if (info.NumberOfLinks > 1) return;
+
+                string expectedLong, actualFinal;
+                if (!PathGuard.TryGetLongCanonicalPath(diagnosticFile, out expectedLong)
+                    || !PathGuard.TryGetFinalDosPath(h, out actualFinal)
+                    || !string.Equals(actualFinal, expectedLong, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                IntPtr ownedHandle = h;
+                h = IntPtr.Zero;
+                using (SafeFileHandle sfh = new SafeFileHandle(ownedHandle, true))
+                using (FileStream fs = new FileStream(sfh, FileAccess.ReadWrite))
+                {
+                    if (fs.Length > 16384)
+                    {
+                        fs.SetLength(0);
+                        fs.Seek(0, SeekOrigin.Begin);
+                        byte[] header = Encoding.UTF8.GetBytes("bounded log restarted\n");
+                        fs.Write(header, 0, header.Length);
+                    }
+                    else
+                    {
+                        fs.Seek(0, SeekOrigin.End);
+                    }
+                    string line = DateTime.UtcNow.ToString("o") + " action=" + action + " stage=" + stage
+                        + " session=" + scanSessionId + " error="
+                        + (error == null ? "Unavailable" : error.GetType().Name + "/" + error.HResult.ToString("X"))
+                        + Environment.NewLine;
+                    byte[] lineBytes = Encoding.UTF8.GetBytes(line);
+                    fs.Write(lineBytes, 0, lineBytes.Length);
+                    fs.Flush();
+                }
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            finally
+            {
+                if (h != IntPtr.Zero && h != new IntPtr(-1))
+                {
+                    try { CloseHandle(h); } catch { }
+                }
+            }
         }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
     }
 
     private volatile bool cleaning;
     private volatile bool recyclingSingle;
-    private bool isClosingGracefully;
+    private volatile bool closingOrDisposed;
+    private volatile bool isClosingGracefully;
     private string cleanLockedReason = "";
     private volatile bool cleanStopRequested;
 
@@ -1775,35 +2124,23 @@ public sealed class AnPingBridge : IDisposable
 
     public void StopFileOpGracefully(int maxWaitMs)
     {
-        if (isClosingGracefully) return;
-        if (!IsBusyWithFileOp) return;
-
+        closingOrDisposed = true;
         isClosingGracefully = true;
+        cleanStopRequested = true;
+        if (!IsBusyWithFileOp || maxWaitMs <= 0) return;
+
         try
         {
-            if (cleaning) cleanStopRequested = true;
-            if (maxWaitMs <= 0) return;
-
-            Stopwatch sw = Stopwatch.StartNew();
-            while (IsBusyWithFileOp && sw.ElapsedMilliseconds < maxWaitMs)
-            {
-                try { Application.DoEvents(); } catch { }
-                if (!IsBusyWithFileOp) break;
-                Thread.Sleep(15);
-                try { Application.DoEvents(); } catch { }
-            }
+            activeFileOpDone.Wait(maxWaitMs);
         }
-        finally
-        {
-            isClosingGracefully = false;
-        }
+        catch (ObjectDisposedException) { }
     }
 
     private void SendCleanSummary(Dictionary<string, object> msg)
     {
         object request = msg.ContainsKey("request") ? msg["request"] : null;
-        object sid;
-        if (!msg.TryGetValue("scanSessionId", out sid) || !(sid is int || sid is long) || Convert.ToInt64(sid) != scanSessionId || scanOpen || cleaning || recyclingSingle)
+        long sid;
+        if (!TryGetInt64(msg, "scanSessionId", out sid) || sid != scanSessionId || scanOpen || cleaning || recyclingSingle)
         {
             PostMessage(new { action = "cleanSummary", request = request, scanSessionId = scanSessionId, error = "扫描或清理状态已变化，请稍后重新打开清单。" });
             return;
@@ -1923,6 +2260,7 @@ public sealed class AnPingBridge : IDisposable
         string logPath = GetDeleteLogPath();
         cleaning = true;
         cleanStopRequested = false;
+        activeFileOpDone.Reset();
         PostMessage(new { action = "cleanProgress", request = request, done = 0, total = reqs.Count, deleted = 0, deletedBytes = 0L, currentPath = "" });
 
         var worker = new Thread(delegate()
@@ -1996,20 +2334,35 @@ public sealed class AnPingBridge : IDisposable
                 }
             }
             catch (Exception ex) { fail = ex; }
+            finally
+            {
+                try { activeFileOpDone.Set(); } catch (ObjectDisposedException) { }
+            }
 
             DispatchToUiThread(delegate() { FinishClean(request, session0, picked, res, prunedDirs, fail); }, "cleanEligible");
         });
         worker.IsBackground = false;
-        worker.Start();
+        try
+        {
+            worker.Start();
+        }
+        catch (Exception ex)
+        {
+            cleaning = false;
+            try { activeFileOpDone.Set(); } catch (ObjectDisposedException) { }
+            WriteDiagnostic("cleanEligible", "start", ex);
+            PostMessage(new { action = "cleanResult", request = request, error = "无法启动清理任务，请重试。" });
+        }
     }
 
     private void RecycleSingleFile(Dictionary<string, object> msg)
     {
         object request = msg.ContainsKey("request") ? msg["request"] : null;
-        int id = msg.ContainsKey("id") && (msg["id"] is int || msg["id"] is long) ? Convert.ToInt32(msg["id"]) : -1;
+        int id;
+        if (!TryGetInt32(msg, "id", out id)) id = -1;
 
-        object sid;
-        if (!msg.TryGetValue("scanSessionId", out sid) || !(sid is int || sid is long) || Convert.ToInt64(sid) != scanSessionId)
+        long sid;
+        if (!TryGetInt64(msg, "scanSessionId", out sid) || sid != scanSessionId)
         {
             PostMessage(new { action = "recycleSingleResult", request = request, id = id, success = false, error = "扫描会话已变化，请重新打开文件详情。" });
             return;
@@ -2066,6 +2419,7 @@ public sealed class AnPingBridge : IDisposable
         IRecycleBin customBin = customTestRecycleBin;
         string logPath = GetDeleteLogPath();
         recyclingSingle = true;
+        activeFileOpDone.Reset();
 
         var worker = new Thread(delegate()
         {
@@ -2079,15 +2433,36 @@ public sealed class AnPingBridge : IDisposable
             {
                 fail = ex;
             }
+            finally
+            {
+                try { activeFileOpDone.Set(); } catch (ObjectDisposedException) { }
+            }
             DispatchToUiThread(delegate() { FinishSingleRecycle(request, session0, id, r, outcome, fail); }, "recycleSingleFile");
         });
         worker.IsBackground = false;
         worker.SetApartmentState(ApartmentState.STA);
-        worker.Start();
+        try
+        {
+            worker.Start();
+        }
+        catch (Exception ex)
+        {
+            recyclingSingle = false;
+            try { activeFileOpDone.Set(); } catch (ObjectDisposedException) { }
+            WriteDiagnostic("recycleSingleFile", "start", ex);
+            PostMessage(new { action = "recycleSingleResult", request = request, id = id, success = false, error = "无法启动移入回收站任务，请重试。" });
+        }
     }
 
     private void DispatchToUiThread(Action action, string opName)
     {
+        bool uiGone = (webView == null || webView.IsDisposed) && (hostForm == null || hostForm.IsDisposed);
+        if (closingOrDisposed || (uiGone && messageCaptureForTest == null))
+        {
+            if (opName == "cleanEligible") cleaning = false;
+            if (opName == "recycleSingleFile") recyclingSingle = false;
+            return;
+        }
         try
         {
             if (webView != null && !webView.IsDisposed && webView.IsHandleCreated)
@@ -2100,7 +2475,13 @@ public sealed class AnPingBridge : IDisposable
                 hostForm.BeginInvoke(action);
                 return;
             }
-            action();
+            if (messageCaptureForTest != null)
+            {
+                action();
+                return;
+            }
+            if (opName == "cleanEligible") cleaning = false;
+            if (opName == "recycleSingleFile") recyclingSingle = false;
         }
         catch (Exception ex)
         {
@@ -2203,6 +2584,15 @@ public sealed class AnPingBridge : IDisposable
                 directorySummary.RemoveRows(removedRows);
             }
             allRows.RemoveAll(delegate(ListRow r) { return deleted.Contains(r.Path); });
+            for (int i = 0; i < removedRows.Count; i++)
+            {
+                int rid;
+                if (rowIds.TryGetValue(removedRows[i], out rid))
+                {
+                    rowIds.Remove(removedRows[i]);
+                    idMap.Remove(rid);
+                }
+            }
             lastDirectorySummaryUpdateCount = allRows.Count;
             RebuildLiveAccumulators();
             detailSnapshot = null;
@@ -2276,18 +2666,26 @@ public sealed class AnPingBridge : IDisposable
             || action == "pendingClean" || action == "relaunchAdminResult";
         try
         {
-            string json = serializer.Serialize(payload);
+            string json;
+            lock (outboundSerLock)
+            {
+                json = outboundSerializer.Serialize(payload);
+            }
             Action<string> capture = messageCaptureForTest;
             if (capture != null)
             {
                 try { capture(json); } catch { }
             }
-            if (webView == null || webView.IsDisposed) { if (important && capture == null) WriteDiagnostic(action, "core-unavailable", null); return; }
+            if (webView == null || webView.IsDisposed || !webView.IsHandleCreated)
+            {
+                if (important && capture == null) WriteDiagnostic(action, "core-unavailable", null);
+                return;
+            }
             webView.BeginInvoke(new Action(delegate()
             {
                 try
                 {
-                    if (webView.CoreWebView2 == null) { if (important) WriteDiagnostic(action, "core-unavailable", null); return; }
+                    if (webView.IsDisposed || webView.CoreWebView2 == null) { if (important) WriteDiagnostic(action, "core-unavailable", null); return; }
                     webView.CoreWebView2.PostWebMessageAsJson(json);
                 }
                 catch (Exception error) { if (important) WriteDiagnostic(action, "post", error); }
@@ -2298,11 +2696,17 @@ public sealed class AnPingBridge : IDisposable
 
     public void Dispose()
     {
+        closingOrDisposed = true;
+        isClosingGracefully = true;
         cleanStopRequested = true;
         progressTimer.Stop();
         progressTimer.Dispose();
         scanOpen = false;
         session.Shutdown(TimeSpan.FromMilliseconds(250));
+        if (activeFileOpDone.IsSet)
+        {
+            try { activeFileOpDone.Dispose(); } catch { }
+        }
     }
 
     internal static string FormatGb(long bytes)

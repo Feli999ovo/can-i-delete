@@ -43,9 +43,23 @@ function fake(state = 'running') {
   audio.beginSession(1);
   assert.equal(await audio.play('complete', 1), false);
   audio.setEnabled(true);
+  assert.equal(await audio.play('toString', 1), false, 'prototype key must be rejected without throwing');
+  assert.equal(audio.lastResult.status, 'invalid-event');
+  assert.equal(await audio.play('constructor', 1), false);
+  assert.equal(await audio.play('__proto__', 1), false);
   for (const kind of ['hover', 'click', 'complete']) assert.equal(await audio.play(kind, 1), true);
   assert.equal(events.length, 3);
   assert.equal(await audio.play('complete', 1), false);
+
+  let fakeNow = 1000;
+  const debounced = new Controller({ createContext: () => fake(), now: () => fakeNow });
+  debounced.setEnabled(true);
+  assert.equal(await debounced.play('click'), true);
+  fakeNow += 10;
+  assert.equal(await debounced.play('click'), false, 'rapid click within 25ms must be debounced');
+  assert.equal(debounced.lastResult.status, 'throttled');
+  fakeNow += 20;
+  assert.equal(await debounced.play('click'), true, 'click after 25ms debounce must play');
   assert(cues.hover.duration >= 0.04 && cues.hover.duration <= 0.065);
   assert(cues.click.duration >= 0.09 && cues.click.duration <= 0.13);
   assert(cues.complete.duration >= 0.35 && cues.complete.duration <= 0.5);

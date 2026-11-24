@@ -204,9 +204,15 @@ public sealed class ScanSessionHost
                 return false;
             }
             string norm = NormalizeScanRoot(raw);
-            if (norm.Length == 0)
+            if (norm.Length == 0 || !PathGuard.IsLocalDrivePath(norm))
             {
-                why = "扫描路径无效：" + raw;
+                why = "扫描路径无效（仅支持本地磁盘路径）：" + raw;
+                lastRefusal = why;
+                return false;
+            }
+            if (PathGuard.HasAnyReparseComponent(norm))
+            {
+                why = "扫描根目录或其上级路径不能是符号链接或重解析点：" + raw;
                 lastRefusal = why;
                 return false;
             }
@@ -235,6 +241,7 @@ public sealed class ScanSessionHost
             return false;
         }
 
+        PathPool.Clear();
         engine = new ScanEngine(normalized, budget, enumerator, analyzer);
         currentRoots.Clear();
         currentRoots.AddRange(normalized);
@@ -412,10 +419,17 @@ public sealed class ScanSessionHost
         ScanEngine e = engine;
         if (e != null && !e.HasExited)
         {
+            state = ScanSessionState.Cancelling;
+            e.RequestCancel();
             e.StopConsuming();
             // 暂停态下必须等它醒过来、释放游标再走 —— 否则 Reset 之后
             // 会短暂存在一个已经没人引用的线程 + 打开的 find 句柄。
             e.WaitForExit(TimeSpan.FromSeconds(3));
+            if (!e.HasExited)
+            {
+                // 生产者尚未退出时严禁清空 engine 或复位 Idle，防止同时并发第二个引擎。
+                return;
+            }
         }
         if (e != null && e.HasExited) e.AbandonPending();
         engine = null;
@@ -428,6 +442,27 @@ public sealed class ScanSessionHost
     }
 
     // ---- 预算钩子 ----
+
+    private static int ClampInt(double v, int min, int max)
+    {
+        if (v < (double)min) return min;
+        if (v > (double)max) return max;
+        return (int)v;
+    }
+
+    private static long ClampLong(double v, long min, long max)
+    {
+        if (v < (double)min) return min;
+        if (v > (double)max) return max;
+        return (long)v;
+    }
+
+    private static double ClampDouble(double v, double min, double max)
+    {
+        if (v < min) return min;
+        if (v > max) return max;
+        return v;
+    }
 
     /// <summary>
     /// 正式扫描默认高容量预算；若设置了验收钩子
@@ -456,20 +491,21 @@ public sealed class ScanSessionHost
             string v = raw.Substring(eq + 1).Trim();
             double num;
             if (!double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out num)) continue;
+            if (double.IsNaN(num) || double.IsInfinity(num) || num <= 0.0) continue;
 
             switch (k)
             {
-                case "entries": b.MaxTopLevelEntries = (int)num; break;
-                case "analyzed": b.MaxAnalyzedEntries = (int)num; break;
-                case "files": b.MaxFileStats = (long)num; break;
-                case "dirs": b.MaxDirVisits = (long)num; break;
-                case "hash": b.MaxHashBytes = (long)(num * 1024 * 1024); break;
-                case "time": b.MaxDuration = TimeSpan.FromSeconds(num); break;
-                case "rows": b.MaxPendingRows = (int)num; break;
-                case "batch": b.BatchSize = (int)num; break;
+                case "entries": b.MaxTopLevelEntries = ClampInt(num, 1, 5000000); break;
+                case "analyzed": b.MaxAnalyzedEntries = ClampInt(num, 1, 5000000); break;
+                case "files": b.MaxFileStats = ClampLong(num, 1L, 5000000L); break;
+                case "dirs": b.MaxDirVisits = ClampLong(num, 1L, 5000000L); break;
+                case "hash": b.MaxHashBytes = ClampLong(num * 1024.0 * 1024.0, 1L, 16L * 1024L * 1024L * 1024L); break;
+                case "time": b.MaxDuration = TimeSpan.FromSeconds(ClampDouble(num, 0.1, 86400.0)); break;
+                case "rows": b.MaxPendingRows = ClampInt(num, 1, 65536); break;
+                case "batch": b.BatchSize = ClampInt(num, 1, 4096); break;
                 // v0.5.0 第三批：全会话累计结果上限与暂停保留时长（测试用短值）
-                case "sessionrows": b.MaxSessionRows = (int)num; break;
-                case "park": b.MaxParkedDuration = TimeSpan.FromSeconds(num); break;
+                case "sessionrows": b.MaxSessionRows = ClampInt(num, 1, 5000000); break;
+                case "park": b.MaxParkedDuration = TimeSpan.FromSeconds(ClampDouble(num, 0.1, 3600.0)); break;
             }
         }
         return b;

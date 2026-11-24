@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Win32.SafeHandles;
 
 // =====================================================================
 // 内容级正向证据与独占句柄流复核：
@@ -19,12 +21,13 @@ public enum EvidenceKind
 }
 
 /// <summary>
-/// 内容校验的字节预算。预算不足 ⇒ 校验不得通过（fail-closed）。
+/// 内容校验的字节预算。预算不足 ⇒ 校验不得通过（fail-closed）。线程安全。
 /// </summary>
 public sealed class HashBudget
 {
     public static readonly HashBudget Unlimited = new HashBudget(-1);
 
+    private readonly object gate = new object();
     private readonly long total;
     private long remaining;
     private bool denied;
@@ -36,18 +39,21 @@ public sealed class HashBudget
     }
 
     public long Total { get { return total; } }
-    public long Remaining { get { return remaining; } }
+    public long Remaining { get { lock (gate) { return remaining; } } }
     public bool IsUnlimited { get { return total < 0; } }
-    public bool Exhausted { get { return !IsUnlimited && remaining < 8; } }
-    public bool Denied { get { return denied; } }
+    public bool Exhausted { get { if (IsUnlimited) return false; lock (gate) { return denied || remaining < 8; } } }
+    public bool Denied { get { lock (gate) { return denied; } } }
 
     public bool TryConsume(long bytes)
     {
         if (IsUnlimited) return true;
         if (bytes < 0) return false;
-        if (remaining < bytes) { denied = true; return false; }
-        remaining -= bytes;
-        return true;
+        lock (gate)
+        {
+            if (remaining < bytes) { denied = true; return false; }
+            remaining -= bytes;
+            return true;
+        }
     }
 }
 
@@ -72,71 +78,125 @@ public static class ContentVerifier
     public const int StructuredHeadBytes = 64;
     public const int HashChunkBytes = 1024 * 1024;
 
+    private const uint GENERIC_READ = 0x80000000u;
+    private const uint FILE_READ_ATTRIBUTES = 0x00000080u;
+    private const uint SHARE_ALL = 0x01u | 0x02u | 0x04u;
+    private const uint OPEN_EXISTING = 3u;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000u;
+    private const uint FILE_ATTR_DIRECTORY = 0x00000010u;
+    private const uint FILE_ATTR_REPARSE_POINT = 0x00000400u;
+    private const int ERROR_SHARING_VIOLATION = 32;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint Low; public uint High; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME CreationTime;
+        public FILETIME LastAccessTime;
+        public FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(IntPtr handle, out BY_HANDLE_FILE_INFORMATION info);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(200);
+
     private static readonly Regex BrowserUserDataRegex =
-        new Regex(@"[\\/]user data[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]user data[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex BrowserBlockfileSubdirRegex =
-        new Regex(@"[\\/](cache[\\/]cache_data|gpucache|dawncache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](cache[\\/]cache_data|gpucache|dawncache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex BrowserCodeCacheSubdirRegex =
-        new Regex(@"[\\/]code cache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]code cache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex BrowserBlockfileShardNameRegex =
-        new Regex(@"^f_[0-9a-f]{6,8}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^f_[0-9a-f]{6,8}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex BrowserCodeCacheEntryNameRegex =
-        new Regex(@"^[0-9a-f]{16}_([0-9a-f]+|s)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^[0-9a-f]{16}_([0-9a-f]+|s)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FirefoxCache2SubdirRegex =
-        new Regex(@"[\\/]cache2[\\/]entries[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]cache2[\\/]entries[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FirefoxStartupSubdirRegex =
-        new Regex(@"[\\/]startupcache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]startupcache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FirefoxEntryNameRegex =
-        new Regex(@"^[0-9a-f]{40}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^[0-9a-f]{40}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FirefoxStartupFileNameRegex =
-        new Regex(@"^.+\.(little|bin)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^.+\.(little|bin)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex AppCachedDataSubdirRegex =
-        new Regex(@"[\\/](code|cursor)[\\/]cacheddata[\\/][0-9a-f]{8,64}[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](code|cursor)[\\/]cacheddata[\\/][0-9a-f]{8,64}[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex AppCachedVsixSubdirRegex =
-        new Regex(@"[\\/](code|cursor)[\\/]cachedextensionvsixs[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](code|cursor)[\\/]cachedextensionvsixs[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex D3dsCacheSubdirRegex =
-        new Regex(@"[\\/]d3dscache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]d3dscache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex VendorShaderSubdirRegex =
-        new Regex(@"[\\/](dxcache|dxccache|glcache|nv_cache|vkcache|shadercache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](dxcache|dxccache|glcache|nv_cache|vkcache|shadercache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex VendorShaderHexFileRegex =
-        new Regex(@"^[0-9a-fA-F_]{6,64}(\.(?!lock$)[a-z0-9]{1,6})?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^[0-9a-fA-F_]{6,64}(\.(?!lock$)[a-z0-9]{1,6})?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex PipHttpSubdirRegex =
-        new Regex(@"[\\/]pip[\\/]cache[\\/](http|http-v2)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]pip[\\/]cache[\\/](http|http-v2)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex NuGetCacheSubdirRegex =
-        new Regex(@"[\\/](nuget[\\/]v3-cache|v3-cache|nuget[-_a-z0-9]*)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](nuget[\\/]v3-cache|v3-cache|nuget[-_a-z0-9]*)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex YarnPnpmCacheSubdirRegex =
-        new Regex(@"[\\/](yarn[\\/]cache|yarn-cache|pnpm-cache|pnpm[\\/]cache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](yarn[\\/]cache|yarn-cache|pnpm-cache|pnpm[\\/]cache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex GoBuildEntryRegex =
-        new Regex(@"[\\/]go-build[\\/]([0-9a-f]{2}[\\/][0-9a-f]{64}-[ad]|trim\.txt|README)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]go-build[\\/]([0-9a-f]{2}[\\/][0-9a-f]{64}-[ad]|trim\.txt|README)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex UvCacheSubdirRegex =
-        new Regex(@"[\\/]uv[\\/]cache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]uv[\\/]cache[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex OfficeTempDraftNameRegex =
-        new Regex(@"^(~\$|~df|~wr)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^(~\$|~df|~wr)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex TempDirSegmentRegex =
-        new Regex(@"[\\/]temp[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]temp[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex ArchivePreviewTempDirRegex =
-        new Regex(@"[\\/]temp[\\/](7z[oO][^\\/]*|rar\$[^\\/]*|wz[0-9a-f]{4})[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]temp[\\/](7z[oO][^\\/]*|rar\$[^\\/]*|wz[0-9a-f]{4})[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex TempInstallerSandboxSubdirRegex =
         new Regex(@"[\\/]temp[\\/](is-[a-z0-9]+\.tmp|ns[a-z0-9]+\.tmp|squirreltemp|scoped_dir[0-9]+_[0-9]+|msi[0-9a-f]+\.tmp|\{[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}\}|(edge|chrome)_bits_[0-9]+_[0-9]+|(msedge|chrome)_installer[^\\/]*|pip-(unpack|ephem|req-build)-[^\\/]+|npm-[0-9]+-[0-9a-f]+|pyinstaller-[^\\/]+)[\\/]",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex ChatSnsCacheSubdirRegex =
         new Regex(@"[\\/](sns[\\/]cache|cache[\\/]sns)([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex ChatWebOrAppletSubdirRegex =
         new Regex(@"[\\/](applet|wmpfruntime|xplugin|xweb|radium[\\/]web[\\/]cache|cefcache|webkit_cache|nt_qq[\\/]global[\\/]nt_temp|nt_temp)([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex WinUpdateDownloadSubdirRegex =
         new Regex(@"[\\/]softwaredistribution[\\/]download([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex WinUpdateDataStoreSubdirRegex =
         new Regex(@"[\\/]datastore([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
 
+    private const long PoolCacheTtlTicks = 5L * TimeSpan.TicksPerSecond;
     private static readonly object poolCacheGate = new object();
-    private static readonly HashSet<string> confirmedBlockfileDirs =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    private static readonly HashSet<string> confirmedCodeCacheDirs =
-        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static int poolCacheEpoch = -1;
+    private static readonly Dictionary<string, long> confirmedBlockfileDirs =
+        new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, long> confirmedCodeCacheDirs =
+        new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+    [ThreadStatic]
+    private static HashBudget activeVerifyBudget;
+    [ThreadStatic]
+    private static bool inPrefetchedScanVerify;
+
+    private static bool ConsumeOpcBudget(long bytes)
+    {
+        if (bytes <= 0) return true;
+        HashBudget b = activeVerifyBudget;
+        if (b == null || b.IsUnlimited) return true;
+        return b.TryConsume(bytes);
+    }
 
     internal static void ClearDirectoryVerifyCache()
     {
@@ -144,12 +204,28 @@ public static class ContentVerifier
         {
             confirmedBlockfileDirs.Clear();
             confirmedCodeCacheDirs.Clear();
+            poolCacheEpoch = CacheRuleRegistry.CurrentRefreshEpoch;
+        }
+    }
+
+    private static void EnsurePoolCacheEpochLocked()
+    {
+        int cur = CacheRuleRegistry.CurrentRefreshEpoch;
+        if (poolCacheEpoch != cur)
+        {
+            confirmedBlockfileDirs.Clear();
+            confirmedCodeCacheDirs.Clear();
+            poolCacheEpoch = cur;
         }
     }
 
     internal static ContentEvidence VerifyPrefetched(string ruleId, string path, byte[] head, long len,
                                                      HashBudget budget, Func<bool> cancelled)
     {
+        HashBudget prevBudget = activeVerifyBudget;
+        bool prevPrefetch = inPrefetchedScanVerify;
+        activeVerifyBudget = budget;
+        inPrefetchedScanVerify = true;
         try
         {
             string fail;
@@ -185,6 +261,10 @@ public static class ContentVerifier
             }
             if (ruleId == "TMP-WER")
             {
+                string werExt = "";
+                try { werExt = (Path.GetExtension(path) ?? "").ToLowerInvariant(); } catch { werExt = ""; }
+                if (werExt == ".dmp" || werExt == ".mdmp" || werExt == ".hdmp")
+                    return VerifyCrashDump(path, budget, cancelled);
                 if (!CheckPrefetchedHead(head, 8, budget, cancelled, out fail))
                     return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
                 return VerifyWerBytes(path, head, len);
@@ -224,6 +304,11 @@ public static class ContentVerifier
                 Detail = "内容校验异常：" + ex.GetType().Name
             };
         }
+        finally
+        {
+            activeVerifyBudget = prevBudget;
+            inPrefetchedScanVerify = prevPrefetch;
+        }
     }
 
     public static ContentEvidence Verify(string ruleId, string path)
@@ -233,6 +318,8 @@ public static class ContentVerifier
 
     public static ContentEvidence Verify(string ruleId, string path, HashBudget budget, Func<bool> cancelled)
     {
+        HashBudget prevBudget = activeVerifyBudget;
+        activeVerifyBudget = budget;
         try
         {
             CacheRuleSpec spec = CacheRuleRegistry.Find(ruleId);
@@ -255,6 +342,10 @@ public static class ContentVerifier
                 Kind = EvidenceKind.None,
                 Detail = "内容校验异常：" + ex.GetType().Name
             };
+        }
+        finally
+        {
+            activeVerifyBudget = prevBudget;
         }
     }
 
@@ -322,12 +413,29 @@ public static class ContentVerifier
         byte[] head; long len; string fail;
         if (!ReadStructuredHead(path, 8, budget, cancelled, out head, out len, out fail))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
+
+        string sig8 = Encoding.ASCII.GetString(head, 0, 8);
+        if (sig8 == "PAGEDU64" || sig8 == "PAGEDUMP")
+            return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "内核转储头（" + sig8 + "）：未做结构校验，不授权清理" };
+        if (head.Length < 32 || Encoding.ASCII.GetString(head, 0, 4) != "MDMP")
+            return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "文件头不匹配 MDMP（或不足 32 字节）" };
+
+        uint version = BitConverter.ToUInt32(head, 4);
+        uint streams = BitConverter.ToUInt32(head, 8);
+        uint rva = BitConverter.ToUInt32(head, 12);
+        if ((version & 0xFFFFu) != 0xA793u)
+            return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "MDMP 版本标记不是 0xA793，结构不符" };
+        if (streams == 0 || streams > 512)
+            return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "MDMP 流数量异常（" + streams + "），结构不符" };
+        if (rva < 32 || (long)rva + (long)streams * 12L > len)
+            return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "MDMP 流目录越出文件范围，结构不符" };
+
         HashBudget b = budget == null ? HashBudget.Unlimited : budget;
-        if (!b.TryConsume(512 * 12))
+        if (!b.TryConsume((long)streams * 12L))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "内容校验字节预算不足，未校验" };
         try
         {
-            using (FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (FileStream fs = OpenNoReparseRead(path))
                 return VerifyCrashDumpBytes(head, fs.Length, fs);
         }
         catch { return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = "无法读取结构数据" }; }
@@ -335,34 +443,55 @@ public static class ContentVerifier
 
     public static string VerifyCrashDumpStream(string path, Stream s)
     {
-        byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifyCrashDumpBytes(head, s.Length, s);
-        return ce.Verified ? null : ce.Detail;
+        if (s == null || !s.CanSeek) return "文件流不可定位";
+        try
+        {
+            byte[] head = ReadStreamHead(s, StructuredHeadBytes);
+            ContentEvidence ce = VerifyCrashDumpBytes(head, s.Length, s);
+            return ce.Verified ? null : ce.Detail;
+        }
+        catch (Exception ex)
+        {
+            return "读取转储流失败：" + ex.GetType().Name;
+        }
     }
 
     public static ContentEvidence VerifyCrashDumpBytes(byte[] head, long len, Stream s)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
-        if (head.Length < 8) { e.Detail = "文件不足 8 字节，结构不完整"; return e; }
+        if (head == null || head.Length < 8) { e.Detail = "文件不足 8 字节，结构不完整"; return e; }
+        if (s == null || !s.CanSeek) { e.Detail = "转储数据流为空或不可定位"; return e; }
         string sig8 = Encoding.ASCII.GetString(head, 0, 8);
         if (sig8 == "PAGEDU64" || sig8 == "PAGEDUMP") { e.Detail = "内核转储头（" + sig8 + "）：未做结构校验，不授权清理"; return e; }
-        if (head.Length < 32 || Encoding.ASCII.GetString(head, 0, 4) != "MDMP") { e.Detail = "文件头不匹配 MDMP（或不足 32 字节）"; return e; }
+        if (len < 32 || head.Length < 32 || Encoding.ASCII.GetString(head, 0, 4) != "MDMP") { e.Detail = "文件头不匹配 MDMP（或不足 32 字节）"; return e; }
         uint version = BitConverter.ToUInt32(head, 4), streams = BitConverter.ToUInt32(head, 8), rva = BitConverter.ToUInt32(head, 12);
-        if ((version & 0xFFFF) != 0xA793) { e.Detail = "MDMP 版本标记不是 0xA793，结构不符"; return e; }
+        if ((version & 0xFFFFu) != 0xA793u) { e.Detail = "MDMP 版本标记不是 0xA793，结构不符"; return e; }
         if (streams == 0 || streams > 512) { e.Detail = "MDMP 流数量异常（" + streams + "），结构不符"; return e; }
-        if (rva < 32 || (long)rva + (long)streams * 12 > len) { e.Detail = "MDMP 流目录越出文件范围，结构不符"; return e; }
+        if (rva < 32 || (long)rva + (long)streams * 12L > len) { e.Detail = "MDMP 流目录越出文件范围，结构不符"; return e; }
         int dirBytes = (int)streams * 12;
         byte[] dir = new byte[dirBytes];
-        s.Position = rva;
-        int read = 0; while (read < dirBytes) { int n = s.Read(dir, read, dirBytes - read); if (n <= 0) break; read += n; }
+        int read = 0;
+        try
+        {
+            s.Position = rva;
+            while (read < dirBytes) { int n = s.Read(dir, read, dirBytes - read); if (n <= 0) break; read += n; }
+        }
+        catch (Exception ex)
+        {
+            e.Detail = "读取 MDMP 流目录失败：" + ex.GetType().Name;
+            return e;
+        }
         if (read != dirBytes) { e.Detail = "读取 MDMP 流目录不完整"; return e; }
         int nonEmpty = 0;
         for (int i = 0; i < (int)streams; i++)
         {
-            uint size = BitConverter.ToUInt32(dir, i * 12 + 4), at = BitConverter.ToUInt32(dir, i * 12 + 8);
-            if (size == 0) continue;
-            if (at < 32 || (long)at + size > len) { e.Detail = "MDMP 第 " + (i + 1) + " 个流的数据越出文件范围，结构不符"; return e; }
+            uint streamType = BitConverter.ToUInt32(dir, i * 12);
+            uint size = BitConverter.ToUInt32(dir, i * 12 + 4);
+            uint at = BitConverter.ToUInt32(dir, i * 12 + 8);
+            if (streamType == 0 || size == 0) continue;
+            if (at < 32 || (long)at + (long)size > len) { e.Detail = "MDMP 第 " + (i + 1) + " 个流的数据越出文件范围，结构不符"; return e; }
+            if ((long)at < (long)rva + (long)dirBytes && (long)at + (long)size > (long)rva) { e.Detail = "MDMP 第 " + (i + 1) + " 个流的数据与流目录重叠，结构不符"; return e; }
             nonEmpty++;
         }
         if (nonEmpty == 0) { e.Detail = "MDMP 没有非空数据流，结构不符"; return e; }
@@ -383,6 +512,7 @@ public static class ContentVerifier
 
     public static string VerifyThumbcacheStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
         ContentEvidence ce = VerifyThumbcacheBytes(path, head, s.Length);
         return ce.Verified ? null : ce.Detail;
@@ -392,9 +522,17 @@ public static class ContentVerifier
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
-        if (Path.GetFileName(path).EndsWith("_idx.db", StringComparison.OrdinalIgnoreCase)) { e.Detail = "索引文件（*_idx.db），不授权清理"; return e; }
-        if (head.Length < 4 || Encoding.ASCII.GetString(head, 0, 4) != "CMMM") { e.Detail = "文件头不匹配 CMMM（索引文件或其他格式）"; return e; }
-        if (head.Length < 24) { e.Detail = "CMMM 文件头不完整（不足 24 字节）"; return e; }
+        if (string.IsNullOrEmpty(path)) { e.Detail = "路径为空"; return e; }
+        string fn = Path.GetFileName(path) ?? "";
+        if (!fn.StartsWith("thumbcache_", StringComparison.OrdinalIgnoreCase)
+            && !fn.StartsWith("iconcache_", StringComparison.OrdinalIgnoreCase))
+        {
+            e.Detail = "文件名不符合 thumbcache_ / iconcache_ 规范";
+            return e;
+        }
+        if (fn.EndsWith("_idx.db", StringComparison.OrdinalIgnoreCase)) { e.Detail = "索引文件（*_idx.db），不授权清理"; return e; }
+        if (head == null || head.Length < 4 || Encoding.ASCII.GetString(head, 0, 4) != "CMMM") { e.Detail = "文件头不匹配 CMMM（索引文件或其他格式）"; return e; }
+        if (head.Length < 24 || len < 24) { e.Detail = "CMMM 文件头不完整（不足 24 字节）"; return e; }
         uint version = BitConverter.ToUInt32(head, 4), type = BitConverter.ToUInt32(head, 8);
         uint first = BitConverter.ToUInt32(head, 16), avail = BitConverter.ToUInt32(head, 20);
         if (version < 20 || version > 40) { e.Detail = "CMMM 格式版本未知（" + version + "）"; return e; }
@@ -437,12 +575,18 @@ public static class ContentVerifier
 
     public static string VerifyAppCacheStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifyAppCacheBytes(path, head, s.Length);
+        ContentEvidence ce = VerifyAppCacheBytesCore(path, head, s.Length, s);
         return ce.Verified ? null : ce.Detail;
     }
 
     public static ContentEvidence VerifyAppCacheBytes(string path, byte[] head, long len)
+    {
+        return VerifyAppCacheBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifyAppCacheBytesCore(string path, byte[] head, long len, Stream streamOrNull)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
@@ -462,7 +606,7 @@ public static class ContentVerifier
 
         string ext = "";
         try { ext = (Path.GetExtension(name) ?? "").ToLowerInvariant(); } catch { ext = ""; }
-        if (ext == ".lock")
+        if (ext == ".lock" || ext == ".lck" || ext == ".lockfile")
         {
             e.Detail = "软件运行锁文件不予清理";
             return e;
@@ -485,7 +629,7 @@ public static class ContentVerifier
                 e.Detail = "检测到用户文档或非插件包头：" + nonZipForbidden;
                 return e;
             }
-            string zipErr = CheckValidZipPackageHeader(head, len, true);
+            string zipErr = CheckValidZipPackageHeader(head, len, true, streamOrNull, path);
             if (zipErr != null)
             {
                 e.Detail = "插件包缓存校验未通过：" + zipErr;
@@ -642,12 +786,25 @@ public static class ContentVerifier
 
         // b) Chromium Blockfile 外部缓存体文件 ^f_[0-9a-f]{6,8}$（无后缀，存储原始 HTTP 响应体，无包装魔数头）
         //    要求位于 Cache\Cache_Data / GPUCache / DawnCache（或测试注入根）内，且同目录存在合法的 Blockfile index 或 data_0 缓存池。
+        //    保留网页响应体（PNG/JPEG/GZIP/PDF/ZIP）的同时硬拦截 SQLite / PEM 私钥 / 注册表 / ESE / KDBX 头。
         if ((inBlockfileSubdir || inInjectedRoot)
             && BrowserBlockfileShardNameRegex.IsMatch(name))
         {
             if (len <= 0 || head.Length == 0)
             {
                 e.Detail = "Blockfile 独立缓存块为空";
+                return e;
+            }
+            if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite")
+                || StartsWithSqliteWalMagic(head))
+            {
+                e.Detail = "拒绝 SQLite 数据库或 WAL 日志头";
+                return e;
+            }
+            if (StartsWithAscii(head, "-----BEGIN ") || StartsWithAscii(head, "regf")
+                || StartsWithEseDbMagic(head) || StartsWithKdbxMagic(head))
+            {
+                e.Detail = "拒绝凭据密钥、密码库、ESE 数据库或注册表头";
                 return e;
             }
             string parentDir = TryGetParentDir(path);
@@ -767,9 +924,10 @@ public static class ContentVerifier
         if (string.IsNullOrEmpty(dir)) return;
         lock (poolCacheGate)
         {
+            EnsurePoolCacheEpochLocked();
             if (confirmedBlockfileDirs.Count >= 4096)
                 confirmedBlockfileDirs.Clear();
-            confirmedBlockfileDirs.Add(dir);
+            confirmedBlockfileDirs[dir] = DateTime.UtcNow.Ticks;
         }
     }
 
@@ -778,8 +936,15 @@ public static class ContentVerifier
         if (string.IsNullOrEmpty(dir)) return false;
         lock (poolCacheGate)
         {
-            if (confirmedBlockfileDirs.Contains(dir))
-                return true;
+            EnsurePoolCacheEpochLocked();
+            long ts;
+            if (confirmedBlockfileDirs.TryGetValue(dir, out ts))
+            {
+                long now = DateTime.UtcNow.Ticks;
+                if (now >= ts && (now - ts) < PoolCacheTtlTicks)
+                    return true;
+                confirmedBlockfileDirs.Remove(dir);
+            }
         }
 
         bool valid = IsValidBlockfileAnchor(Path.Combine(dir, "index"), true)
@@ -797,6 +962,8 @@ public static class ContentVerifier
     {
         try
         {
+            if (string.IsNullOrEmpty(filePath) || PathGuard.HasAnyReparseComponent(filePath))
+                return false;
             FileInfo fi = new FileInfo(filePath);
             if (!fi.Exists) return false;
             FileAttributes attr = fi.Attributes;
@@ -811,20 +978,31 @@ public static class ContentVerifier
                 byte[] head = ReadHead(filePath, 16);
                 if (isIndex)
                 {
-                    if (flen >= 32 && head.Length >= 4 && BitConverter.ToUInt32(head, 0) == 0xc103cac3u)
-                        return true;
+                    if (flen >= 32 && head.Length >= 8 && BitConverter.ToUInt32(head, 0) == 0xc103cac3u)
+                    {
+                        uint ver = BitConverter.ToUInt32(head, 4);
+                        return ver == 0x00020000u || ver == 0x00020001u;
+                    }
                     if (flen >= 16 && head.Length >= 8
                         && (BitConverter.ToUInt64(head, 0) == 0x656e74657220796fUL
                             || BitConverter.ToUInt64(head, 0) == 0xfcfb6d1ba7725c30UL))
                         return true;
                     return false;
                 }
-                return flen >= 32 && head.Length >= 4 && BitConverter.ToUInt32(head, 0) == 0xc104cac3u;
+                if (flen >= 32 && head.Length >= 8 && BitConverter.ToUInt32(head, 0) == 0xc104cac3u)
+                {
+                    uint ver = BitConverter.ToUInt32(head, 4);
+                    return ver == 0x00020000u || ver == 0x00020001u;
+                }
+                return false;
             }
-            catch (IOException)
+            catch (IOException ioEx)
             {
-                // 运行中的浏览器（或测试沙盒）正以独占模式锁住 index / data_0，且该非重解析点文件长度满足池头下限
-                return flen >= (isIndex ? 24L : 32L);
+                // 仅当真实 Chromium Blockfile 纯缓存子目录内的非重解析点池文件因共享冲突 (ERROR_SHARING_VIOLATION=0x20) 被浏览器独占锁定时才放行；其余 IOException 一律 fail-closed
+                bool isSharingViolation = (ioEx.HResult & 0xFFFF) == ERROR_SHARING_VIOLATION;
+                return isSharingViolation
+                    && BrowserBlockfileSubdirRegex.IsMatch(filePath)
+                    && flen >= (isIndex ? 24L : 32L);
             }
         }
         catch
@@ -838,8 +1016,15 @@ public static class ContentVerifier
         if (string.IsNullOrEmpty(dir)) return false;
         lock (poolCacheGate)
         {
-            if (confirmedCodeCacheDirs.Contains(dir))
-                return true;
+            EnsurePoolCacheEpochLocked();
+            long ts;
+            if (confirmedCodeCacheDirs.TryGetValue(dir, out ts))
+            {
+                long now = DateTime.UtcNow.Ticks;
+                if (now >= ts && (now - ts) < PoolCacheTtlTicks)
+                    return true;
+                confirmedCodeCacheDirs.Remove(dir);
+            }
         }
 
         bool valid = HasCodeCacheIndexFilesInDir(dir);
@@ -861,9 +1046,10 @@ public static class ContentVerifier
         {
             lock (poolCacheGate)
             {
+                EnsurePoolCacheEpochLocked();
                 if (confirmedCodeCacheDirs.Count >= 4096)
                     confirmedCodeCacheDirs.Clear();
-                confirmedCodeCacheDirs.Add(dir);
+                confirmedCodeCacheDirs[dir] = DateTime.UtcNow.Ticks;
             }
         }
         return valid;
@@ -880,6 +1066,8 @@ public static class ContentVerifier
     {
         try
         {
+            if (string.IsNullOrEmpty(filePath) || PathGuard.HasAnyReparseComponent(filePath))
+                return false;
             FileInfo fi = new FileInfo(filePath);
             if (!fi.Exists) return false;
             FileAttributes attr = fi.Attributes;
@@ -888,18 +1076,18 @@ public static class ContentVerifier
             long flen = fi.Length;
             if (flen < 16L) return false;
 
-            try
-            {
-                byte[] head = ReadHead(filePath, 32);
-                if (head.Length < 8) return false;
-                if (CheckForbiddenImportantHeader(head) != null) return false;
-                if (IsAllSameByte(head)) return false;
+            byte[] head = ReadHead(filePath, 32);
+            if (head.Length < 8) return false;
+            if (CheckForbiddenImportantHeader(head) != null) return false;
+            if (IsAllSameByte(head)) return false;
+
+            // 必须命中 Chromium Simple Cache 索引魔数（0x656e74657220796f 或 0xfcfb6d1ba7725c30），IOException 一律 fail-closed
+            ulong m0 = BitConverter.ToUInt64(head, 0);
+            if (m0 == 0x656e74657220796fUL || m0 == 0xfcfb6d1ba7725c30UL)
                 return true;
-            }
-            catch (IOException)
-            {
-                return flen >= 16L;
-            }
+            if (head.Length >= 16 && BitConverter.ToUInt64(head, 8) == 0xfcfb6d1ba7725c30UL)
+                return true;
+            return ContainsUInt64Magic(head, 0x656e74657220796fUL);
         }
         catch
         {
@@ -1042,17 +1230,29 @@ public static class ContentVerifier
 
     public static string VerifyPkgCacheStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         string expected;
         if (TryParseCacachePath(path, out expected)
             || (path != null && path.IndexOf("_cacache", StringComparison.OrdinalIgnoreCase) >= 0))
         {
             if (!TryParseCacachePath(path, out expected)) return "路径结构不符";
-            if (s.Length > MaxHashBytes) return "文件超过哈希校验上限";
+            if (s.CanSeek && s.Length > MaxHashBytes) return "文件超过哈希校验上限";
             if (s.CanSeek) s.Position = 0;
             string hex;
+            byte[] buf = new byte[HashChunkBytes];
+            long totalRead = 0;
             using (SHA512 sha = SHA512.Create())
             {
-                byte[] d = sha.ComputeHash(s);
+                while (true)
+                {
+                    int n = s.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    totalRead += n;
+                    if (totalRead > MaxHashBytes) return "文件超过哈希校验上限";
+                    sha.TransformBlock(buf, 0, n, null, 0);
+                }
+                sha.TransformFinalBlock(new byte[0], 0, 0);
+                byte[] d = sha.Hash;
                 StringBuilder sb = new StringBuilder(d.Length * 2);
                 foreach (byte x in d) sb.Append(x.ToString("x2"));
                 hex = sb.ToString();
@@ -1061,23 +1261,29 @@ public static class ContentVerifier
         }
 
         byte[] pkgHead = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence pkgCe = VerifyNonCacachePkgBytes(path, pkgHead, s.Length);
+        ContentEvidence pkgCe = VerifyNonCacachePkgBytesCore(path, pkgHead, s.Length, s);
         return pkgCe.Verified ? null : pkgCe.Detail;
     }
 
     public static ContentEvidence VerifyNonCacachePkgBytes(string path, byte[] head, long len)
     {
+        return VerifyNonCacachePkgBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifyNonCacachePkgBytesCore(string path, byte[] head, long len, Stream streamOrNull)
+    {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
         if (string.IsNullOrEmpty(path)) { e.Detail = "路径为空"; return e; }
+        if (head == null) head = new byte[0];
         string ext = "";
         try { ext = (Path.GetExtension(path) ?? "").ToLowerInvariant(); } catch { ext = ""; }
-        if (ext == ".lock") { e.Detail = "包管理器锁文件不予清理"; return e; }
+        if (ext == ".lock" || ext == ".lck" || ext == ".lockfile") { e.Detail = "包管理器锁文件不予清理"; return e; }
 
         // 1) pip / uv .whl 与 NuGet .nupkg：合法 ZIP Local File Header (PK\x03\x04，且头 >= 30 字节，排除 Office 文档)
         if (ext == ".whl" || ext == ".nupkg")
         {
-            string zipFail = CheckValidZipPackageHeader(head, len, true);
+            string zipFail = CheckValidZipPackageHeader(head, len, true, streamOrNull, path);
             if (zipFail != null)
             {
                 e.Detail = (ext == ".whl" ? "wheel " : "NuGet .nupkg ") + zipFail;
@@ -1183,14 +1389,20 @@ public static class ContentVerifier
                 e.Detail = "检测到非缓存文档/程序头：" + nonZipForbidden;
                 return e;
             }
-            if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && IsOfficeDocumentZip(head))
+            if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
             {
-                e.Detail = "检测到 Office 文档压缩包头，拒绝清理";
+                string pipZipErr = CheckValidZipPackageHeader(head, len, true, streamOrNull, path);
+                if (pipZipErr != null)
+                {
+                    e.Detail = "pip HTTP 缓存 ZIP 校验未通过：" + pipZipErr;
+                    return e;
+                }
+                e.Verified = true;
+                e.Detail = "pip HTTP 缓存条目（ZIP 包头）校验通过";
                 return e;
             }
             bool okPip = StartsWithAscii(head, "cc=4")
                 || (len >= 16 && ((head[0] >= 0x81 && head[0] <= 0x8F) || head[0] == 0xDE))
-                || (len >= 30 && StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
                 || (len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
                 || (len >= 16 && (StartsWithAscii(head, "BZh") || StartsWithBytes(head, 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00)
                                   || StartsWithBytes(head, 0x28, 0xB5, 0x2F, 0xFD)))
@@ -1219,16 +1431,22 @@ public static class ContentVerifier
                 e.Detail = "检测到文档/程序/数据库头：" + nonZipForbidden;
                 return e;
             }
-            if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && IsOfficeDocumentZip(head))
+            if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
             {
-                e.Detail = "检测到 Office 文档压缩包头，拒绝清理";
+                string nugetZipErr = CheckValidZipPackageHeader(head, len, true, streamOrNull, path);
+                if (nugetZipErr != null)
+                {
+                    e.Detail = "NuGet .dat ZIP 校验未通过：" + nugetZipErr;
+                    return e;
+                }
+                e.Verified = true;
+                e.Detail = "NuGet v3 HTTP 缓存（.dat ZIP）结构校验通过";
                 return e;
             }
             bool okNuGet = StartsWithJsonPayload(head)
                 || StartsWithXmlFeed(head)
                 || (len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
-                || (len >= 30 && CheckValidZipPackageHeader(head, len, true) == null)
-                || HasBinaryFraming(head, 16);
+                || (!StartsWithBytes(head, 0x50, 0x4B) && HasBinaryFraming(head, 16));
             if (!okNuGet)
             {
                 e.Detail = "NuGet .dat 内容不匹配 JSON/XML/压缩或二进制缓存结构";
@@ -1256,7 +1474,7 @@ public static class ContentVerifier
 
             if (ext == ".zip")
             {
-                string zipErr = CheckValidZipPackageHeader(head, len, true);
+                string zipErr = CheckValidZipPackageHeader(head, len, true, streamOrNull, path);
                 if (zipErr != null)
                 {
                     e.Detail = "Yarn/pnpm .zip " + zipErr;
@@ -1287,7 +1505,7 @@ public static class ContentVerifier
                     return e;
                 }
                 bool okDat = (len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
-                    || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true) == null)
+                    || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true, streamOrNull, path) == null)
                     || StartsWithJsonPayload(head)
                     || (!StartsWithBytes(head, 0x50, 0x4B) && HasBinaryFraming(head, 16));
                 if (!okDat)
@@ -1304,7 +1522,7 @@ public static class ContentVerifier
             if (ext.Length == 0)
             {
                 bool okBlob = (len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
-                    || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true) == null)
+                    || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true, streamOrNull, path) == null)
                     || StartsWithJsonPayload(head);
                 if (!okBlob)
                 {
@@ -1337,17 +1555,40 @@ public static class ContentVerifier
         return digits >= 6;
     }
 
-    private static string CheckValidZipPackageHeader(byte[] head, long len, bool rejectOfficeInnerDirs)
+    private static string CheckValidZipPackageHeader(byte[] head, long len, bool rejectOfficeInnerDirs, Stream streamOrNull, string pathOrNull)
     {
         if (!StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
             return "文件头不匹配 ZIP 魔数 PK\\x03\\x04";
-        if (len < 30 || head.Length < 30)
+        if (len < 30 || head == null || head.Length < 30)
             return "ZIP 包头不足 30 字节，结构不完整";
         ushort fileNameLen = BitConverter.ToUInt16(head, 26);
-        if (30L + fileNameLen > len)
+        ushort extraFieldLen = BitConverter.ToUInt16(head, 28);
+        if (fileNameLen == 0)
+            return "ZIP 本地文件头条目名为空，结构不完整";
+        if (30L + (long)fileNameLen + (long)extraFieldLen > len)
             return "ZIP 本地文件头记录长度越出文件边界";
-        if (rejectOfficeInnerDirs && IsOfficeDocumentZip(head))
-            return "命中 Office 文档内部目录特征，拒绝作为缓存清理";
+
+        if (rejectOfficeInnerDirs)
+        {
+            if (IsOfficeDocumentZip(head))
+                return "命中 Office 文档内部目录特征，拒绝作为缓存清理";
+
+            bool isOpcFirst = IsOpcCandidateFirstEntry(head);
+            if (streamOrNull != null)
+            {
+                if (IsOfficeOpcZipStream(streamOrNull, isOpcFirst, pathOrNull))
+                    return "命中 Office OpenXML 文档包结构（Central Directory 含 word/xl/ppt/visio），拒绝作为缓存清理";
+            }
+            else if (!string.IsNullOrEmpty(pathOrNull))
+            {
+                if (IsOfficeOpcZipFile(pathOrNull, isOpcFirst))
+                    return "命中 Office OpenXML 文档包结构（Central Directory 含 word/xl/ppt/visio），拒绝作为缓存清理";
+            }
+            else if (isOpcFirst)
+            {
+                return "命中 OPC 压缩包头且无法检查 Central Directory，保守拒绝清理";
+            }
+        }
         return null;
     }
 
@@ -1358,11 +1599,217 @@ public static class ContentVerifier
         int avail = Math.Min((int)nameLen, head.Length - 30);
         if (avail <= 0) return false;
         string entry = Encoding.ASCII.GetString(head, 30, avail);
+        return IsOfficeZipEntryName(entry);
+    }
+
+    private static bool IsOpcCandidateFirstEntry(byte[] head)
+    {
+        if (head == null || head.Length <= 30) return false;
+        ushort nameLen = BitConverter.ToUInt16(head, 26);
+        int avail = Math.Min((int)nameLen, head.Length - 30);
+        if (avail <= 0) return false;
+        string entry = Encoding.ASCII.GetString(head, 30, avail);
+        return entry.StartsWith("[Content_Types].xml", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("_rels/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("_rels\\", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("docProps/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("docProps\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOfficeZipEntryName(string entry)
+    {
+        if (string.IsNullOrEmpty(entry)) return false;
         return entry.StartsWith("word/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("word\\", StringComparison.OrdinalIgnoreCase)
             || entry.StartsWith("xl/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("xl\\", StringComparison.OrdinalIgnoreCase)
             || entry.StartsWith("ppt/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("ppt\\", StringComparison.OrdinalIgnoreCase)
             || entry.StartsWith("visio/", StringComparison.OrdinalIgnoreCase)
+            || entry.StartsWith("visio\\", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(entry, "mimetype", StringComparison.OrdinalIgnoreCase)
             || entry.StartsWith("mimetype", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOfficeOpcZipFile(string path, bool failClosedOnUnreadable)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return failClosedOnUnreadable;
+            using (FileStream fs = OpenNoReparseRead(path))
+            {
+                return IsOfficeOpcZipStream(fs, failClosedOnUnreadable, path);
+            }
+        }
+        catch
+        {
+            return failClosedOnUnreadable;
+        }
+    }
+
+    private static bool IsOfficeOpcZipStream(Stream s, bool failClosedOnMissingEocd, string pathOrNull)
+    {
+        if (s == null || !s.CanSeek) return failClosedOnMissingEocd;
+        long savedPos = s.Position;
+        try
+        {
+            long fileLen = s.Length;
+            if (fileLen < 22) return failClosedOnMissingEocd;
+
+            const int MinEocdLen = 22;
+            const int MaxTailRead = 65536;
+            const int MaxCdRead = 512 * 1024;
+            const int MaxCdEntries = 4096;
+
+            // 先只读末尾 22 字节快速定位无注释 EOCD；未命中再放宽到 64KB 尾部扫描，并将读取计入 HashBudget
+            int tailLen = MinEocdLen;
+            long tailStart = fileLen - tailLen;
+            byte[] tail = new byte[tailLen];
+            s.Position = tailStart;
+            int tailRead = ReadExactUpTo(s, tail, tailLen);
+            if (tailRead < 22) return failClosedOnMissingEocd;
+            if (!ConsumeOpcBudget(tailRead)) return true;
+
+            int eocdPos = -1;
+            if (tail[0] == 0x50 && tail[1] == 0x4B && tail[2] == 0x05 && tail[3] == 0x06
+                && BitConverter.ToUInt16(tail, 20) == 0)
+            {
+                eocdPos = 0;
+            }
+            else if (fileLen > MinEocdLen)
+            {
+                tailLen = (int)Math.Min(fileLen, (long)MaxTailRead);
+                tailStart = fileLen - tailLen;
+                tail = new byte[tailLen];
+                s.Position = tailStart;
+                tailRead = ReadExactUpTo(s, tail, tailLen);
+                if (tailRead < 22) return failClosedOnMissingEocd;
+                if (!ConsumeOpcBudget(tailRead)) return true;
+
+                for (int pos = tailRead - 22; pos >= 0; pos--)
+                {
+                    if (tail[pos] == 0x50 && tail[pos + 1] == 0x4B && tail[pos + 2] == 0x05 && tail[pos + 3] == 0x06)
+                    {
+                        ushort commentLen = BitConverter.ToUInt16(tail, pos + 20);
+                        if (pos + 22 + commentLen <= tailRead)
+                        {
+                            eocdPos = pos;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (eocdPos < 0) return failClosedOnMissingEocd;
+
+            ushort totalEntries = BitConverter.ToUInt16(tail, eocdPos + 10);
+            uint cdSize = BitConverter.ToUInt32(tail, eocdPos + 12);
+            uint cdOffset = BitConverter.ToUInt32(tail, eocdPos + 16);
+
+            // ZIP64 哨兵（如 System.IO.Packaging 将 [Content_Types].xml 写在末尾）：
+            // 若首条目已命中 OPC 则一律拒绝；否则仅允许已知非 Office 扩展名（.nupkg/.vsix/.whl）
+            bool isZip64 = (totalEntries == 0xFFFF || cdSize == 0xFFFFFFFFu || cdOffset == 0xFFFFFFFFu);
+            if (isZip64)
+            {
+                if (failClosedOnMissingEocd) return true;
+                string zExt = "";
+                try { zExt = string.IsNullOrEmpty(pathOrNull) ? "" : (Path.GetExtension(pathOrNull) ?? "").ToLowerInvariant(); } catch { zExt = ""; }
+                if (zExt != ".nupkg" && zExt != ".vsix" && zExt != ".whl")
+                    return true;
+                return false;
+            }
+
+            // totalEntries==0 却声明非空 Central Directory 视为损坏/畸形，保守拒绝
+            if (totalEntries == 0)
+                return cdSize > 0 ? true : failClosedOnMissingEocd;
+            if (cdSize == 0)
+                return failClosedOnMissingEocd;
+            if ((long)cdOffset + (long)cdSize > fileLen)
+                return failClosedOnMissingEocd;
+
+            int readCdLen = (int)Math.Min((long)cdSize, (long)MaxCdRead);
+            byte[] cdBuf;
+            int cdBufStart;
+            if ((long)cdOffset >= tailStart && (long)cdOffset + readCdLen <= tailStart + tailRead)
+            {
+                cdBuf = tail;
+                cdBufStart = (int)((long)cdOffset - tailStart);
+            }
+            else
+            {
+                cdBuf = new byte[readCdLen];
+                s.Position = cdOffset;
+                int got = ReadExactUpTo(s, cdBuf, readCdLen);
+                if (!ConsumeOpcBudget(got)) return true;
+                if (got < 46) return failClosedOnMissingEocd;
+                readCdLen = got;
+                cdBufStart = 0;
+            }
+
+            int p = cdBufStart;
+            int end = cdBufStart + readCdLen;
+            int scanned = 0;
+            bool sawKnownNonOfficePkgMarker = false;
+            int maxEntries = Math.Min((int)totalEntries, MaxCdEntries);
+
+            while (p + 46 <= end && scanned < maxEntries)
+            {
+                if (cdBuf[p] != 0x50 || cdBuf[p + 1] != 0x4B || cdBuf[p + 2] != 0x01 || cdBuf[p + 3] != 0x02)
+                {
+                    return failClosedOnMissingEocd;
+                }
+                ushort nameLen = BitConverter.ToUInt16(cdBuf, p + 28);
+                ushort extraLen = BitConverter.ToUInt16(cdBuf, p + 30);
+                ushort commentLen = BitConverter.ToUInt16(cdBuf, p + 32);
+                int entryTotal = 46 + nameLen + extraLen + commentLen;
+                if (p + 46 + nameLen > end)
+                    return failClosedOnMissingEocd;
+
+                if (nameLen > 0)
+                {
+                    string entryName = Encoding.UTF8.GetString(cdBuf, p + 46, nameLen);
+                    if (IsOfficeZipEntryName(entryName))
+                        return true;
+                    if (entryName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(entryName, "extension.vsixmanifest", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(entryName, "extension/package.json", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sawKnownNonOfficePkgMarker = true;
+                    }
+                }
+
+                scanned++;
+                p += entryTotal;
+            }
+
+            // 若 OPC 压缩包的 Central Directory 未完全扫完（截断、超 512KB 或超 4096 项）且未见明确 .nupkg/.vsix 标识，保守拒绝
+            if (failClosedOnMissingEocd && !sawKnownNonOfficePkgMarker
+                && (cdSize > (uint)MaxCdRead || totalEntries > MaxCdEntries || scanned < (int)totalEntries))
+            {
+                return true;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return failClosedOnMissingEocd;
+        }
+        finally
+        {
+            try { if (s.CanSeek) s.Position = savedPos; } catch { }
+        }
+    }
+
+    private static int ReadExactUpTo(Stream s, byte[] buf, int count)
+    {
+        int read = 0;
+        while (read < count)
+        {
+            int n = s.Read(buf, read, count - read);
+            if (n <= 0) break;
+            read += n;
+        }
+        return read;
     }
 
     // ---------- 6. 系统与软件临时文件（%LOCALAPPDATA%\Temp 下分级冷却与结构保护） ---------- //
@@ -1372,17 +1819,23 @@ public static class ContentVerifier
         byte[] head; long len; string fail;
         if (!ReadStructuredHead(path, 1, budget, cancelled, out head, out len, out fail))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
-        return VerifySystemTempBytes(path, head, len);
+        return VerifySystemTempBytesCore(path, head, len, null);
     }
 
     public static string VerifySystemTempStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifySystemTempBytes(path, head, s.Length);
+        ContentEvidence ce = VerifySystemTempBytesCore(path, head, s.Length, s);
         return ce.Verified ? null : ce.Detail;
     }
 
     public static ContentEvidence VerifySystemTempBytes(string path, byte[] head, long len)
+    {
+        return VerifySystemTempBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifySystemTempBytesCore(string path, byte[] head, long len, Stream streamOrNull)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
@@ -1391,6 +1844,21 @@ public static class ContentVerifier
             e.Detail = "路径为空";
             return e;
         }
+
+        // 直接调用防护：必须位于受控 Temp 路径或测试注入的 TMP-SYSTEMP 根目录内
+        bool inTempScope = TempDirSegmentRegex.IsMatch(path) || PathGuard.IsInControlledRoot(path);
+        if (!inTempScope && CacheRoots.HasInjectedForTest)
+        {
+            string matchedRule, matchedWhy;
+            inTempScope = CacheRoots.Match(path, out matchedRule, out matchedWhy)
+                && string.Equals(matchedRule, "TMP-SYSTEMP", StringComparison.Ordinal);
+        }
+        if (!inTempScope)
+        {
+            e.Detail = "不在受控系统或用户临时目录内";
+            return e;
+        }
+
         string name = Path.GetFileName(path);
         if (name == null) name = "";
         string ext = "";
@@ -1408,15 +1876,9 @@ public static class ContentVerifier
         }
 
         DateTime lastWriteUtc;
-        try
+        if (!TryGetLastWriteUtcFromStream(streamOrNull, path, out lastWriteUtc))
         {
-            FileInfo fi = new FileInfo(path);
-            if (!fi.Exists) { e.Detail = "文件不存在或不是普通文件"; return e; }
-            lastWriteUtc = fi.LastWriteTimeUtc;
-        }
-        catch
-        {
-            e.Detail = "无法读取文件修改时间";
+            e.Detail = "无法从句柄安全读取文件修改时间";
             return e;
         }
 
@@ -1440,7 +1902,7 @@ public static class ContentVerifier
                 e.Detail = "修改时间未满 48 小时";
                 return e;
             }
-            string personalForbidden = CheckInstallerSandboxForbiddenHeader(head, len);
+            string personalForbidden = CheckInstallerSandboxForbiddenHeader(head, len, streamOrNull, path);
             if (personalForbidden != null)
             {
                 e.Detail = "含受保护文档或程序头（" + personalForbidden + "）";
@@ -1507,7 +1969,7 @@ public static class ContentVerifier
         }
     }
 
-    private static string CheckInstallerSandboxForbiddenHeader(byte[] head, long len)
+    private static string CheckInstallerSandboxForbiddenHeader(byte[] head, long len, Stream streamOrNull, string pathOrNull)
     {
         if (head == null || head.Length == 0) return null;
         if (StartsWithBytes(head, 0xD0, 0xCF, 0x11, 0xE0))
@@ -1516,10 +1978,14 @@ public static class ContentVerifier
             return "PDF 文档头";
         if (StartsWithAscii(head, "8BPS"))
             return "Photoshop PSD 文档头";
-        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite"))
-            return "SQLite 数据库头";
+        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite") || StartsWithSqliteWalMagic(head))
+            return "SQLite 数据库或 WAL 头";
         if (StartsWithAscii(head, "-----BEGIN "))
             return "PEM 证书或私钥头";
+        if (StartsWithKdbxMagic(head))
+            return "KeePass 密码库头（KDBX）";
+        if (StartsWithPkcs12Magic(head))
+            return "PKCS#12 证书私钥头";
         if (StartsWithAscii(head, "regf"))
             return "注册表配置单元头";
         if (StartsWithAscii(head, "{\\rtf"))
@@ -1529,7 +1995,7 @@ public static class ContentVerifier
 
         if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
         {
-            string zipCheck = CheckValidZipPackageHeader(head, len, true);
+            string zipCheck = CheckValidZipPackageHeader(head, len, true, streamOrNull, pathOrNull);
             if (zipCheck != null) return zipCheck;
         }
         else if (StartsWithBytes(head, 0x50, 0x4B, 0x05, 0x06)
@@ -1544,20 +2010,33 @@ public static class ContentVerifier
 
     public static ContentEvidence VerifyWer(string path, HashBudget budget, Func<bool> cancelled)
     {
+        string ext = "";
+        try { ext = (Path.GetExtension(path) ?? "").ToLowerInvariant(); } catch { ext = ""; }
+        if (ext == ".dmp" || ext == ".mdmp" || ext == ".hdmp")
+        {
+            return VerifyCrashDump(path, budget, cancelled);
+        }
+
         byte[] head; long len; string fail;
         if (!ReadStructuredHead(path, 8, budget, cancelled, out head, out len, out fail))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
-        return VerifyWerBytes(path, head, len);
+        return VerifyWerBytesCore(path, head, len, null);
     }
 
     public static string VerifyWerStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifyWerBytes(path, head, s.Length);
+        ContentEvidence ce = VerifyWerBytesCore(path, head, s.Length, s);
         return ce.Verified ? null : ce.Detail;
     }
 
     public static ContentEvidence VerifyWerBytes(string path, byte[] head, long len)
+    {
+        return VerifyWerBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifyWerBytesCore(string path, byte[] head, long len, Stream streamOrNull)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
@@ -1630,26 +2109,30 @@ public static class ContentVerifier
 
         if (ext == ".dmp" || ext == ".mdmp" || ext == ".hdmp")
         {
-            string sig8 = Encoding.ASCII.GetString(head, 0, 8);
-            if (sig8 == "PAGEDU64" || sig8 == "PAGEDUMP")
+            if (streamOrNull != null)
             {
-                e.Detail = "内核转储头（" + sig8 + "）：拒绝自动清理";
+                try
+                {
+                    return VerifyCrashDumpBytes(head, len, streamOrNull);
+                }
+                catch (Exception ex)
+                {
+                    e.Detail = "读取 WER 转储流失败：" + ex.GetType().Name;
+                    return e;
+                }
+            }
+            try
+            {
+                using (FileStream fs = OpenNoReparseRead(path))
+                {
+                    return VerifyCrashDumpBytes(head, fs.Length, fs);
+                }
+            }
+            catch
+            {
+                e.Detail = "无法打开 WER 转储文件进行完整 MDMP 流目录校验";
                 return e;
             }
-            if (len < 32 || head.Length < 8 || !StartsWithBytes(head, 0x4D, 0x44, 0x4D, 0x50))
-            {
-                e.Detail = "文件头不匹配 MDMP（或不足 32 字节）";
-                return e;
-            }
-            uint ver = BitConverter.ToUInt32(head, 4);
-            if ((ver & 0xFFFFu) != 0xA793u)
-            {
-                e.Detail = "MDMP 版本标记不是 0xA793，结构不符";
-                return e;
-            }
-            e.Verified = true;
-            e.Detail = "WER 转储附件（MDMP 0xA793）头校验通过";
-            return e;
         }
 
         e.Detail = "扩展名不在 WER 报告白名单（.wer / .cab / .dmp / .mdmp / .hdmp）内";
@@ -1671,17 +2154,23 @@ public static class ContentVerifier
         byte[] head; long len; string fail;
         if (!ReadStructuredHead(path, 16, budget, cancelled, out head, out len, out fail))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
-        return VerifyChatCacheBytes(path, head, len);
+        return VerifyChatCacheBytesCore(path, head, len, null);
     }
 
     public static string VerifyChatCacheStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifyChatCacheBytes(path, head, s.Length);
+        ContentEvidence ce = VerifyChatCacheBytesCore(path, head, s.Length, s);
         return ce.Verified ? null : ce.Detail;
     }
 
     public static ContentEvidence VerifyChatCacheBytes(string path, byte[] head, long len)
+    {
+        return VerifyChatCacheBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifyChatCacheBytesCore(string path, byte[] head, long len, Stream streamOrNull)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
@@ -1712,10 +2201,9 @@ public static class ContentVerifier
 
         string ext = "";
         try { ext = (Path.GetExtension(name) ?? "").ToLowerInvariant(); } catch { ext = ""; }
-        if (ext == ".lock" || ext == ".db" || ext == ".sqlite" || ext == ".exe"
-            || ext == ".dll" || ext == ".sys" || ext == ".ini" || ext == ".cfg" || ext == ".config")
+        if (IsForbiddenChatCacheExtension(ext))
         {
-            e.Detail = "锁文件、数据库、程序模块或配置文件不作为聊天缓存清理";
+            e.Detail = "锁文件、数据库、凭据私钥、程序模块或配置文件不作为聊天缓存清理";
             return e;
         }
 
@@ -1773,7 +2261,7 @@ public static class ContentVerifier
         }
 
         // 分支 B：小程序（.wxapkg / Applet）与内置网页/插件缓存（WMPFRuntime / XPlugin / xweb / CefCache / webkit_cache / nt_temp）
-        string appletForbidden = CheckChatAppletOrWebForbiddenHeader(head, len);
+        string appletForbidden = CheckChatAppletOrWebForbiddenHeader(head, len, streamOrNull, path);
         if (appletForbidden != null)
         {
             e.Detail = "检测到受保护文档、数据库或程序头：" + appletForbidden;
@@ -1848,7 +2336,7 @@ public static class ContentVerifier
         }
 
         if ((len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
-            || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true) == null)
+            || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true, streamOrNull, path) == null)
             || (!StartsWithTextBom(head) && HasBinaryFraming(head, Math.Min(head.Length, 24))))
         {
             e.Verified = true;
@@ -1858,6 +2346,41 @@ public static class ContentVerifier
 
         e.Detail = "内容为纯文本或未知结构，不符合聊天软件纯缓存特征";
         return e;
+    }
+
+    private static bool IsForbiddenChatCacheExtension(string ext)
+    {
+        switch (ext)
+        {
+            case ".lock":
+            case ".lck":
+            case ".lockfile":
+            case ".db":
+            case ".db-wal":
+            case ".db-shm":
+            case ".db-journal":
+            case ".sqlite":
+            case ".sqlite3":
+            case ".sqlite-wal":
+            case ".sqlite-shm":
+            case ".exe":
+            case ".dll":
+            case ".sys":
+            case ".ini":
+            case ".cfg":
+            case ".config":
+            case ".key":
+            case ".pem":
+            case ".pfx":
+            case ".p12":
+            case ".cer":
+            case ".crt":
+            case ".env":
+            case ".kdbx":
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static string CheckSnsCacheForbiddenHeader(byte[] head)
@@ -1870,8 +2393,8 @@ public static class ContentVerifier
             return "ZIP 或 Office OpenXML 压缩包头（PK）";
         if (StartsWithAscii(head, "%PDF"))
             return "PDF 文档头";
-        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite"))
-            return "SQLite 数据库头";
+        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite") || StartsWithSqliteWalMagic(head))
+            return "SQLite 数据库或 WAL 头";
         if (StartsWithBytes(head, 0x4D, 0x5A))
             return "PE 可执行程序或动态库头（MZ）";
         if (StartsWithBytes(head, 0x52, 0x61, 0x72, 0x21))
@@ -1884,20 +2407,22 @@ public static class ContentVerifier
             return "Photoshop PSD 文档头";
         if (StartsWithAscii(head, "-----BEGIN "))
             return "PEM 证书或私钥头";
+        if (StartsWithKdbxMagic(head))
+            return "KeePass 密码库头（KDBX）";
+        if (StartsWithPkcs12Magic(head))
+            return "PKCS#12 证书私钥头";
         if (StartsWithAscii(head, "regf"))
             return "注册表配置单元头";
         return null;
     }
 
-    private static string CheckChatAppletOrWebForbiddenHeader(byte[] head, long len)
+    private static string CheckChatAppletOrWebForbiddenHeader(byte[] head, long len, Stream streamOrNull, string pathOrNull)
     {
         if (StartsWithBytes(head, 0xD0, 0xCF, 0x11, 0xE0))
             return "Office OLE2 复合文档头";
         if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
         {
-            if (IsOfficeDocumentZip(head))
-                return "Office OpenXML 文档头";
-            string zipErr = CheckValidZipPackageHeader(head, len, true);
+            string zipErr = CheckValidZipPackageHeader(head, len, true, streamOrNull, pathOrNull);
             if (zipErr != null)
                 return zipErr;
         }
@@ -1908,8 +2433,8 @@ public static class ContentVerifier
         }
         if (StartsWithAscii(head, "%PDF"))
             return "PDF 文档头";
-        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite"))
-            return "SQLite 数据库头";
+        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite") || StartsWithSqliteWalMagic(head))
+            return "SQLite 数据库或 WAL 头";
         if (StartsWithBytes(head, 0x4D, 0x5A))
             return "PE 可执行程序或动态库头（MZ）";
         if (StartsWithBytes(head, 0x52, 0x61, 0x72, 0x21))
@@ -1922,6 +2447,10 @@ public static class ContentVerifier
             return "Photoshop PSD 文档头";
         if (StartsWithAscii(head, "-----BEGIN "))
             return "PEM 证书或私钥头";
+        if (StartsWithKdbxMagic(head))
+            return "KeePass 密码库头（KDBX）";
+        if (StartsWithPkcs12Magic(head))
+            return "PKCS#12 证书私钥头";
         if (StartsWithAscii(head, "regf"))
             return "注册表配置单元头";
         return null;
@@ -1951,17 +2480,23 @@ public static class ContentVerifier
         byte[] head; long len; string fail;
         if (!ReadStructuredHead(path, 16, budget, cancelled, out head, out len, out fail))
             return new ContentEvidence { Kind = EvidenceKind.MagicHeader, Detail = fail };
-        return VerifyWinUpdateBytes(path, head, len);
+        return VerifyWinUpdateBytesCore(path, head, len, null);
     }
 
     public static string VerifyWinUpdateStream(string path, Stream s)
     {
+        if (s == null) return "文件流为空";
         byte[] head = ReadStreamHead(s, StructuredHeadBytes);
-        ContentEvidence ce = VerifyWinUpdateBytes(path, head, s.Length);
+        ContentEvidence ce = VerifyWinUpdateBytesCore(path, head, s.Length, s);
         return ce.Verified ? null : ce.Detail;
     }
 
     public static ContentEvidence VerifyWinUpdateBytes(string path, byte[] head, long len)
+    {
+        return VerifyWinUpdateBytesCore(path, head, len, null);
+    }
+
+    private static ContentEvidence VerifyWinUpdateBytesCore(string path, byte[] head, long len, Stream streamOrNull)
     {
         ContentEvidence e = new ContentEvidence();
         e.Kind = EvidenceKind.MagicHeader;
@@ -1999,26 +2534,16 @@ public static class ContentVerifier
         }
         string ext = "";
         try { ext = (Path.GetExtension(name) ?? "").ToLowerInvariant(); } catch { ext = ""; }
-        if (ext == ".lock" || ext == ".edb")
+        if (IsForbiddenWinUpdateExtension(ext))
         {
-            e.Detail = "锁文件或 ESE 数据库文件不予清理";
+            e.Detail = "文档、证书、媒体、锁文件或数据库文件不作为系统更新缓存清理";
             return e;
         }
 
         DateTime lastWriteUtc;
-        try
+        if (!TryGetLastWriteUtcFromStream(streamOrNull, path, out lastWriteUtc))
         {
-            FileInfo fi = new FileInfo(path);
-            if (!fi.Exists)
-            {
-                e.Detail = "文件不存在或不是普通文件";
-                return e;
-            }
-            lastWriteUtc = fi.LastWriteTimeUtc;
-        }
-        catch
-        {
-            e.Detail = "无法读取文件修改时间";
+            e.Detail = "无法从句柄安全读取文件修改时间";
             return e;
         }
 
@@ -2040,7 +2565,7 @@ public static class ContentVerifier
             return e;
         }
 
-        string forbidden = CheckWinUpdateForbiddenHeader(head, len);
+        string forbidden = CheckWinUpdateForbiddenHeader(head, len, streamOrNull, path);
         if (forbidden != null)
         {
             e.Detail = "检测到个人创作文档或受保护数据库头：" + forbidden;
@@ -2068,7 +2593,7 @@ public static class ContentVerifier
             return e;
         }
 
-        if (StartsWithJsonPayload(head) || StartsWithWinUpdateXmlManifest(head))
+        if (StartsWithJsonPayload(head) || StartsWithWinUpdateXmlManifest(head, streamOrNull, path))
         {
             e.Verified = true;
             e.Detail = "Windows Update 更新清单（XML/JSON 结构，已满 48 小时）校验通过";
@@ -2079,7 +2604,7 @@ public static class ContentVerifier
             || StartsWithAscii(head, "PA30")
             || StartsWithAscii(head, "PA19")
             || (len >= 18 && StartsWithBytes(head, 0x1F, 0x8B, 0x08))
-            || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true) == null)
+            || (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04) && CheckValidZipPackageHeader(head, len, true, streamOrNull, path) == null)
             || (!StartsWithTextBom(head) && HasBinaryFraming(head, Math.Min(head.Length, 24))))
         {
             e.Verified = true;
@@ -2091,15 +2616,62 @@ public static class ContentVerifier
         return e;
     }
 
-    private static string CheckWinUpdateForbiddenHeader(byte[] head, long len)
+    private static bool IsForbiddenWinUpdateExtension(string ext)
+    {
+        switch (ext)
+        {
+            case ".lock":
+            case ".lck":
+            case ".lockfile":
+            case ".edb":
+            case ".docx":
+            case ".doc":
+            case ".xlsx":
+            case ".xls":
+            case ".pptx":
+            case ".ppt":
+            case ".pdf":
+            case ".psd":
+            case ".rtf":
+            case ".pfx":
+            case ".p12":
+            case ".cer":
+            case ".crt":
+            case ".key":
+            case ".pem":
+            case ".kdbx":
+            case ".jpg":
+            case ".jpeg":
+            case ".png":
+            case ".gif":
+            case ".bmp":
+            case ".webp":
+            case ".heic":
+            case ".mp4":
+            case ".mov":
+            case ".avi":
+            case ".mkv":
+            case ".sqlite":
+            case ".sqlite3":
+            case ".sqlite-wal":
+            case ".sqlite-shm":
+            case ".db":
+            case ".db-wal":
+            case ".db-shm":
+            case ".db-journal":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static string CheckWinUpdateForbiddenHeader(byte[] head, long len, Stream streamOrNull, string pathOrNull)
     {
         if (StartsWithBytes(head, 0xD0, 0xCF, 0x11, 0xE0))
             return "Office OLE2 复合文档头";
         if (StartsWithBytes(head, 0x50, 0x4B, 0x03, 0x04))
         {
-            if (IsOfficeDocumentZip(head))
-                return "Office OpenXML 文档头";
-            string zipCheck = CheckValidZipPackageHeader(head, len, true);
+            string zipCheck = CheckValidZipPackageHeader(head, len, true, streamOrNull, pathOrNull);
             if (zipCheck != null)
                 return zipCheck;
         }
@@ -2112,10 +2684,25 @@ public static class ContentVerifier
             return "PDF 文档头";
         if (StartsWithAscii(head, "8BPS"))
             return "Photoshop PSD 文档头";
-        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite"))
-            return "SQLite 数据库头";
-        if (head.Length >= 8 && head[4] == 0xEF && head[5] == 0xCD && head[6] == 0xAB && head[7] == 0x89)
+        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite") || StartsWithSqliteWalMagic(head))
+            return "SQLite 数据库或 WAL 头";
+        if (StartsWithEseDbMagic(head))
             return "Windows ESE (DataStore.edb) 数据库头";
+        if (StartsWithKdbxMagic(head))
+            return "KeePass 密码库头（KDBX）";
+        if (StartsWithPkcs12Magic(head))
+            return "PKCS#12 证书私钥头";
+        if (StartsWithBytes(head, 0x89, 0x50, 0x4E, 0x47))
+            return "PNG 图像头";
+        if (StartsWithBytes(head, 0xFF, 0xD8, 0xFF))
+            return "JPEG 图像头";
+        if (StartsWithAscii(head, "GIF87a") || StartsWithAscii(head, "GIF89a"))
+            return "GIF 图像头";
+        if (head.Length >= 12 && StartsWithAscii(head, "RIFF")
+            && head[8] == (byte)'W' && head[9] == (byte)'E' && head[10] == (byte)'B' && head[11] == (byte)'P')
+            return "WebP 图像头";
+        if (head.Length >= 12 && head[4] == (byte)'f' && head[5] == (byte)'t' && head[6] == (byte)'y' && head[7] == (byte)'p')
+            return "MP4 媒体容器头";
         if (StartsWithAscii(head, "-----BEGIN "))
             return "PEM 证书或私钥头";
         if (StartsWithAscii(head, "regf"))
@@ -2136,28 +2723,58 @@ public static class ContentVerifier
             || StartsWithBytes(head, 0xFE, 0xFF);
     }
 
-    private static bool StartsWithWinUpdateXmlManifest(byte[] head)
+    private static bool ContainsWinUpdateXmlTag(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        return text.IndexOf("<Update", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<Package", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<assembly", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<unattend", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<Deployment", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<WindowsUpdate", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<Manifest", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("<Metadata", StringComparison.OrdinalIgnoreCase) >= 0
+            || text.IndexOf("schemas.microsoft.com", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool StartsWithWinUpdateXmlManifest(byte[] head, Stream streamOrNull, string pathOrNull)
     {
         if (head == null || head.Length < 6) return false;
-        if (head[0] == 0xFF && head[1] == 0xFE)
+        byte[] sample = head;
+        if (head.Length < 256)
         {
-            int even = (head.Length - 2) & ~1;
-            if (even < 8) return false;
-            string u16 = Encoding.Unicode.GetString(head, 2, even).TrimStart();
-            return u16.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase)
-                || u16.StartsWith("<Update", StringComparison.OrdinalIgnoreCase)
-                || u16.StartsWith("<Package", StringComparison.OrdinalIgnoreCase)
-                || u16.StartsWith("<assembly", StringComparison.OrdinalIgnoreCase);
+            if (streamOrNull != null && streamOrNull.CanSeek)
+            {
+                long saved = streamOrNull.Position;
+                try
+                {
+                    sample = ReadStreamHead(streamOrNull, 256);
+                }
+                catch { sample = head; }
+                finally
+                {
+                    try { streamOrNull.Position = saved; } catch { }
+                }
+            }
+            else if (!string.IsNullOrEmpty(pathOrNull))
+            {
+                try { sample = ReadHead(pathOrNull, 256); }
+                catch { sample = head; }
+            }
         }
-        int i = SkipUtf8BomAndWhitespace(head);
-        if (i + 5 > head.Length || head[i] != (byte)'<') return false;
-        string s = Encoding.ASCII.GetString(head, i, Math.Min(20, head.Length - i));
-        return s.StartsWith("<?xml", StringComparison.OrdinalIgnoreCase)
-            || s.StartsWith("<Update", StringComparison.OrdinalIgnoreCase)
-            || s.StartsWith("<Package", StringComparison.OrdinalIgnoreCase)
-            || s.StartsWith("<assembly", StringComparison.OrdinalIgnoreCase)
-            || s.StartsWith("<unattend", StringComparison.OrdinalIgnoreCase)
-            || s.StartsWith("<Deployment", StringComparison.OrdinalIgnoreCase);
+
+        if (sample.Length >= 10 && sample[0] == 0xFF && sample[1] == 0xFE)
+        {
+            int even = (sample.Length - 2) & ~1;
+            if (even < 8) return false;
+            string u16 = Encoding.Unicode.GetString(sample, 2, even).TrimStart();
+            if (!u16.StartsWith("<", StringComparison.Ordinal)) return false;
+            return ContainsWinUpdateXmlTag(u16);
+        }
+        int i = SkipUtf8BomAndWhitespace(sample);
+        if (i + 5 > sample.Length || sample[i] != (byte)'<') return false;
+        string s = Encoding.UTF8.GetString(sample, i, sample.Length - i);
+        return ContainsWinUpdateXmlTag(s);
     }
 
     // ---------- cacache：结构 + 内容 SHA-512 哈希 ---------- //
@@ -2185,7 +2802,13 @@ public static class ContentVerifier
         DateTime mtimeBefore;
         try
         {
+            if (PathGuard.HasAnyReparseComponent(path)) { e.Detail = "路径包含重解析点，未校验"; return e; }
             FileInfo before = new FileInfo(path);
+            if (!before.Exists || (before.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            {
+                e.Detail = "目标不存在或为重解析点";
+                return e;
+            }
             len = before.Length;
             mtimeBefore = before.LastWriteTimeUtc;
         }
@@ -2193,19 +2816,21 @@ public static class ContentVerifier
         if (len > MaxHashBytes) { e.Detail = "文件超过哈希校验上限（" + MaxHashBytes + " 字节）"; return e; }
 
         HashBudget b = budget == null ? HashBudget.Unlimited : budget;
-        if (!b.TryConsume(len))
+        long charge = Math.Max(len, (long)StructuredHeadBytes);
+        if (!b.TryConsume(charge))
         {
-            e.Detail = "内容校验字节预算不足（本次需 " + len + " 字节，剩余 " + b.Remaining + "），未校验";
+            e.Detail = "内容校验字节预算不足（本次需 " + charge + " 字节，剩余 " + b.Remaining + "），未校验";
             return e;
         }
 
         string actual, fail;
-        if (!TryHashFileChunked(path, cancelled, out actual, out fail)) { e.Detail = fail; return e; }
+        long maxRead = Math.Min(len, MaxHashBytes);
+        if (!TryHashFileChunked(path, maxRead, cancelled, out actual, out fail)) { e.Detail = fail; return e; }
 
         try
         {
             FileInfo after = new FileInfo(path);
-            if (!after.Exists || after.Length != len ||
+            if (!after.Exists || (after.Attributes & FileAttributes.ReparsePoint) != 0 || after.Length != len ||
                 Math.Abs((after.LastWriteTimeUtc - mtimeBefore).TotalSeconds) > 2)
             {
                 e.Detail = "校验期间文件发生变化，未校验";
@@ -2228,19 +2853,32 @@ public static class ContentVerifier
 
     public static bool TryHashFileChunked(string path, Func<bool> cancelled, out string hex, out string fail)
     {
+        return TryHashFileChunked(path, MaxHashBytes, cancelled, out hex, out fail);
+    }
+
+    public static bool TryHashFileChunked(string path, long maxBytes, Func<bool> cancelled, out string hex, out string fail)
+    {
         hex = "";
         fail = "";
+        if (maxBytes < 0) maxBytes = 0;
         byte[] buf = new byte[HashChunkBytes];
         try
         {
-            using (FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (FileStream fs = OpenNoReparseRead(path))
             using (SHA512 sha = SHA512.Create())
             {
+                long totalRead = 0;
                 while (true)
                 {
                     if (cancelled != null && cancelled()) { fail = "内容校验已取消，未校验"; return false; }
                     int n = fs.Read(buf, 0, buf.Length);
                     if (n <= 0) break;
+                    totalRead += n;
+                    if (totalRead > maxBytes)
+                    {
+                        fail = "文件超过哈希校验上限（读取中体积增长），未校验";
+                        return false;
+                    }
                     sha.TransformBlock(buf, 0, n, null, 0);
                 }
                 sha.TransformFinalBlock(new byte[0], 0, 0);
@@ -2282,6 +2920,94 @@ public static class ContentVerifier
 
     // ---------- 公共底层辅助 ---------- //
 
+    private static FileStream OpenNoReparseRead(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            throw new IOException("路径为空");
+
+        IntPtr h = CreateFileW(path, GENERIC_READ | FILE_READ_ATTRIBUTES, SHARE_ALL,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+        if (h == new IntPtr(-1) || h == IntPtr.Zero)
+        {
+            int err = Marshal.GetLastWin32Error();
+            int hr = unchecked((int)(0x80070000u | (uint)(err & 0xFFFF)));
+            throw new IOException("无法打开文件（Win32=" + err + "）", hr);
+        }
+
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(h, out info)
+            || (info.FileAttributes & (FILE_ATTR_DIRECTORY | FILE_ATTR_REPARSE_POINT)) != 0)
+        {
+            CloseHandle(h);
+            throw new IOException("目标为目录或重解析点，拒绝打开");
+        }
+
+        SafeFileHandle sfh = new SafeFileHandle(h, true);
+        try
+        {
+            return new FileStream(sfh, FileAccess.Read);
+        }
+        catch
+        {
+            sfh.Dispose();
+            throw;
+        }
+    }
+
+    private static bool TryGetLastWriteUtcFromStream(Stream s, string path, out DateTime utc)
+    {
+        utc = DateTime.MinValue;
+        FileStream fs = s as FileStream;
+        if (fs != null)
+        {
+            try
+            {
+                SafeFileHandle sfh = fs.SafeFileHandle;
+                if (sfh == null || sfh.IsInvalid || sfh.IsClosed) return false;
+                bool addedRef = false;
+                try
+                {
+                    sfh.DangerousAddRef(ref addedRef);
+                    BY_HANDLE_FILE_INFORMATION info;
+                    if (!GetFileInformationByHandle(sfh.DangerousGetHandle(), out info))
+                        return false;
+                    if ((info.FileAttributes & (FILE_ATTR_DIRECTORY | FILE_ATTR_REPARSE_POINT)) != 0)
+                        return false;
+                    long ft = ((long)info.LastWriteTime.High << 32) | info.LastWriteTime.Low;
+                    utc = DateTime.FromFileTimeUtc(ft);
+                    return true;
+                }
+                finally
+                {
+                    if (addedRef) sfh.DangerousRelease();
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // 非 FileStream（扫描期或内存测试流）：仅对非重解析点普通文件读取 LastWriteTimeUtc
+        // 扫描预取热路径已由 SafetyPolicy.DecideCore 前置核验 HasReparseRiskForPolicy，避免重复祖先链遍历
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            if (!inPrefetchedScanVerify && PathGuard.HasAnyReparseComponent(path))
+                return false;
+            FileInfo fi = new FileInfo(path);
+            if (!fi.Exists) return false;
+            if ((fi.Attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+                return false;
+            utc = fi.LastWriteTimeUtc;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static bool CheckPrefetchedHead(byte[] head, int minBytes, HashBudget budget, Func<bool> cancelled, out string fail)
     {
         fail = "";
@@ -2301,10 +3027,11 @@ public static class ContentVerifier
         if (!b.TryConsume(StructuredHeadBytes)) { fail = "内容校验字节预算不足（需 " + StructuredHeadBytes + " 字节），未校验"; return false; }
         try
         {
-            using (FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (FileStream fs = OpenNoReparseRead(path))
             {
                 len = fs.Length;
                 int want = (int)Math.Min(len, (long)StructuredHeadBytes);
+                if (want < 0) want = 0;
                 byte[] buf = new byte[want];
                 int read = 0;
                 while (read < want)
@@ -2332,8 +3059,12 @@ public static class ContentVerifier
 
     private static byte[] ReadStreamHead(Stream s, int maxBytes)
     {
+        if (s == null || maxBytes <= 0) return new byte[0];
         if (s.CanSeek) s.Position = 0;
-        byte[] head = new byte[(int)Math.Min(s.Length, maxBytes)];
+        long slen = s.CanSeek ? s.Length : (long)maxBytes;
+        if (slen <= 0) return new byte[0];
+        int want = (int)Math.Min(slen, (long)maxBytes);
+        byte[] head = new byte[want];
         int read = 0;
         while (read < head.Length)
         {
@@ -2345,6 +3076,31 @@ public static class ContentVerifier
         byte[] trimmed = new byte[read];
         Array.Copy(head, trimmed, read);
         return trimmed;
+    }
+
+    private static bool StartsWithSqliteWalMagic(byte[] head)
+    {
+        return head != null && head.Length >= 4
+            && head[0] == 0x37 && head[1] == 0x7F && head[2] == 0x06
+            && (head[3] == 0x82 || head[3] == 0x83);
+    }
+
+    private static bool StartsWithEseDbMagic(byte[] head)
+    {
+        return head != null && head.Length >= 8
+            && head[4] == 0xEF && head[5] == 0xCD && head[6] == 0xAB && head[7] == 0x89;
+    }
+
+    private static bool StartsWithKdbxMagic(byte[] head)
+    {
+        return StartsWithBytes(head, 0x03, 0xD9, 0xA2, 0x9A);
+    }
+
+    private static bool StartsWithPkcs12Magic(byte[] head)
+    {
+        return head != null && head.Length >= 7
+            && head[0] == 0x30 && head[1] == 0x82
+            && head[4] == 0x02 && head[5] == 0x01 && head[6] == 0x03;
     }
 
     private static string CheckForbiddenImportantHeader(byte[] head)
@@ -2366,8 +3122,8 @@ public static class ContentVerifier
             return "PDF 文档头";
         if (StartsWithBytes(head, 0x4D, 0x5A))
             return "PE 可执行程序或动态库头（MZ）";
-        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite"))
-            return "SQLite 数据库头";
+        if (StartsWithAscii(head, "SQLite format 3") || StartsWithAscii(head, "SQLite") || StartsWithSqliteWalMagic(head))
+            return "SQLite 数据库或 WAL 头";
         if (StartsWithBytes(head, 0x52, 0x61, 0x72, 0x21))
             return "RAR 压缩包头";
         if (StartsWithBytes(head, 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C))
@@ -2384,6 +3140,10 @@ public static class ContentVerifier
             return "GIF 图像头";
         if (StartsWithAscii(head, "-----BEGIN "))
             return "PEM 证书或私钥头";
+        if (StartsWithKdbxMagic(head))
+            return "KeePass 密码库头（KDBX）";
+        if (StartsWithPkcs12Magic(head))
+            return "PKCS#12 证书私钥头";
         if (StartsWithAscii(head, "regf"))
             return "注册表配置单元头";
         return null;
@@ -2486,7 +3246,7 @@ public static class ContentVerifier
 
     private static byte[] ReadHead(string path, int count)
     {
-        using (FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        using (FileStream fs = OpenNoReparseRead(path))
         {
             byte[] b = new byte[count];
             int read = 0;

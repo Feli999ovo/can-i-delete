@@ -9,12 +9,11 @@ using System.IO;
 //
 // 设计要点：
 //   * 代码级闸门 BuildAllowsRealDeletion（编译期常量）：整改验收通过前，
-//     任何删除都会被拒绝，不依赖界面是否隐藏按钮。
+//     任何批量自动回收都会被拒绝，不依赖界面是否隐藏按钮。
 //   * 授权在执行层重新计算（SafetyPolicy.Decide），扫描快照里的 PolicyEligible
 //     只作为“必须为 true”的前置条件，不作为依据。
-//   * 身份用「卷号 + 文件索引」核对，大小/时间/只读位只作辅助。
+//   * 身份用「卷号 + 文件索引 + 句柄最终真实路径」核对，大小/时间/只读位作辅助。
 //   * 回收站通过 IRecycleBin 抽象，便于用 Fake 做自动化测试。
-//   * 不提供任何永久删除路径；不做权限提升；不结束占用进程。
 // =====================================================================
 
 /// <summary>
@@ -28,9 +27,9 @@ using System.IO;
 /// </summary>
 public enum DeleteStatus
 {
-    /// <summary>有确凿回收证据（当前=事后三重取证；方案 A 落地后=同步 psiNewlyCreated）。</summary>
+    /// <summary>有确凿回收证据（同步 psiNewlyCreated 且落入 $Recycle.Bin）。</summary>
     RecycledVerified,
-    /// <summary>已永久删除并核实：同一句柄核对身份后删除，事后原路径已不存在。**不可恢复**。</summary>
+    /// <summary>已永久删除并核实：同一句柄核对最终路径与身份后删除，事后原路径已不存在。**不可恢复**。</summary>
     DeletedVerified,
     /// <summary>动作尚未派发就被拒绝：授权 / 前置 / 闸门任一未过。**未发生任何操作**。</summary>
     RefusedNotDispatched,
@@ -68,12 +67,12 @@ public enum DeleteRefusalKind
     WeakIdentityChanged,      // 大小 / 修改时间 / 只读位变化
     PolicyRecomputeDenied,    // 执行层重算未通过
     RiskChanged,              // 重算类别与扫描时不一致
-    DirSizeIncomplete,        // 目录体积不完整（**新增**：下界不得当上限用）
+    DirSizeIncomplete,        // 目录体积不完整（下界不得当上限用）
     VolumeNotSupported,       // 卷不支持回收站（非固定盘 / 无 $Recycle.Bin）
     NukeOnDelete,             // 回收站被配置为直接永久删除
-    CapacityUnknown,          // 回收站可用容量未知（**新增**：未知即拒绝）
+    CapacityUnknown,          // 回收站可用容量未知（未知即拒绝）
     CapacityInsufficient,     // 回收站容量不足
-    LogUnwritable,            // 审计日志不可写（**新增**：不可信即不动文件）
+    LogUnwritable,            // 审计日志不可写（不可信即不动文件）
     SafetyStop                // 上一项结果不明，本项未派发
 }
 
@@ -88,7 +87,7 @@ public enum DispatchState
 {
     /// <summary>确定未派发（所有前置拒绝路径，以及因安全原因未执行的尾项）。</summary>
     NotDispatched,
-    /// <summary>**无法确定**：意图记录存在但结果丢失（崩溃遗留）。</summary>
+    /// <summary>**无法确定**：意图记录存在但结果丢失（崩溃遗留或写 intent 后抛异常）。</summary>
     Unknown,
     /// <summary>确定派发过（调用已发生，无论成败）。</summary>
     Dispatched
@@ -155,7 +154,7 @@ public static class DeleteEngine
     /// <summary>
     /// 闸门自检：任何直接调用真实后端都逃不过这一层。
     /// 看的是**编译期常量**，而不是可被测试改写的运行期字段 ——
-    /// 因此本构建里真实回收站永远无法被调用（测试也不行）。
+    /// 因此本构建里真实回收站永远无法被批量调用（测试也不行）。
     /// </summary>
     internal static void RequireGate()
     {
@@ -163,37 +162,25 @@ public static class DeleteEngine
     }
 
     /// <summary>
-    /// 出厂构建是否允许真实删除。P0 验收通过前必须为 false。
+    /// 出厂构建是否允许真实批量回收。P0 验收通过前必须为 false。
     /// 它是编译期常量，也是 RealDeletionEnabled 的初值。
-    /// 要放开删除必须改这一行并重新构建 —— 没有运行期开关能让产品构建放开。
-    /// 自动化测试会直接改写 RealDeletionEnabled，以便验证回收站调用逻辑；
-    /// 产品代码从不修改它（已由测试断言）。
     /// </summary>
     public const bool BuildAllowsRealDeletion = false;
 
     /// <summary>
     /// 唯一的运行期闸门。初值取自编译期常量（当前为 false）。
-    /// 产品代码不写它；只有 tests/SelfTest.cs 会临时置 true。
+    /// 产品代码不写它；只有测试会临时置 true。
     /// </summary>
     public static bool RealDeletionEnabled = BuildAllowsRealDeletion;
 
     /// <summary>
     /// 【四层权限模型的第四层】当前实际是否允许执行删除。
-    ///
-    /// 必须与前三层分清：
-    ///   Risk             —— 文件分析与风险分类（像什么）
-    ///   PolicyEligible   —— 根据证据获得的**候选**清理资格
-    ///   Checked          —— 用户是否选择
-    ///   ExecutionAllowed —— 当前**实际**是否允许执行（含运行期与编译期闸门）
-    ///
-    /// 禁止把「规则认为可以清理」等同于「当前可以执行删除」。
-    /// PolicyEligible == true 而 ExecutionAllowed == false 是正常且预期的状态。
     /// </summary>
     public static bool ExecutionAllowed { get { return RealDeletionEnabled; } }
 
     /// <summary>
     /// 永久删除闸门（用户 2026-11 批准）。只放行 PermanentDeleteBin：同一句柄核对身份后删除、
-    /// 不承诺可恢复。回收站路径仍由 BuildAllowsRealDeletion=false 锁住（NO-GO 未变）。
+    /// 不承诺可恢复。回收站批量路径仍由 BuildAllowsRealDeletion=false 锁住。
     /// </summary>
     public const bool BuildAllowsPermanentDelete = true;
 
@@ -206,11 +193,12 @@ public static class DeleteEngine
 
     /// <summary>
     /// 批量执行。契约要点：
+    ///   * 批次开始刷新缓存根缓存，杜绝过期缓存根授权；
     ///   * 日志不可写 → **整批拒绝派发**；
-    ///   * 逐项独立：一项抛异常不得终止整批，也不得让结果丢失；
+    ///   * 逐项独立：一项抛异常不得终止整批，也不得产生孤立 intent；
     ///   * 出现不明结果（OutcomeUnknown）→ **停止后续危险操作**，
     ///     剩余项标为 NotExecutedDueToStop；
-    ///   * 每项都有唯一 opId，intent 与 outcome 都在日志里可对账。
+    ///   * 每项都有唯一 opId，intent 与 outcome 都在日志里严格配对。
     /// </summary>
     public static List<DeleteOutcome> Execute(IList<DeleteRequest> requests, string scanRoot,
                                               IRecycleBin bin, string logPath)
@@ -252,6 +240,10 @@ public static class DeleteEngine
     {
         List<DeleteOutcome> results = new List<DeleteOutcome>();
         if (requests == null) return results;
+
+        // 批次开始时强制刷新动态缓存根，避免使用扫描期间的陈旧 TTL 快照。
+        CacheRuleRegistry.RefreshRootsCache();
+
         string batchId = DeleteLog.NewOpId();
 
         // ---- 前置：审计日志必须可信，否则不动文件（单次打开会话贯穿整批） ----
@@ -300,19 +292,21 @@ public static class DeleteEngine
                 if (itemProgress != null) itemProgress(index, requests.Count, r, null);
                 index++;
 
+                string opId = DeleteLog.NewOpId();
+                bool intentWritten = false;
                 DeleteOutcome o;
                 try
                 {
-                    o = VerifyAndDelete(r, scanRoots, bin, logPath, batchId, logSession);
+                    o = VerifyAndDelete(r, scanRoots, bin, logPath, batchId, logSession, opId, ref intentWritten);
                 }
                 catch (Exception ex)
                 {
-                    // 逐项隔离：未预期异常也不得让结果丢失或让整批静默中断。
-                    // 此时无法确认目标状态 ⇒ 归为“结果未知”，并触发停止。
+                    // 逐项隔离：保留同一个 opId，确保已落盘的 intent 必有对应 outcome，不留孤立记录。
                     o = new DeleteOutcome();
                     o.Path = r == null ? "" : r.Path;
-                    o.OpId = DeleteLog.NewOpId();
+                    o.OpId = opId;
                     o.Status = DeleteStatus.OutcomeUnknown;
+                    o.Dispatch = intentWritten ? DispatchState.Unknown : DispatchState.NotDispatched;
                     o.Detail = "执行过程中出现未预期异常（" + ex.GetType().Name + "），"
                              + "无法确认目标状态，请立即检查回收站与原位置。";
                 }
@@ -342,7 +336,7 @@ public static class DeleteEngine
     /// <summary>
     /// 专供用户在「大文件 / 文件详情」手动点选单个文件确认后调用的受控单文件回收入口。
     /// 保持 BuildAllowsRealDeletion=false 锁死批量自动回收，此处仅允许单次送入 Windows 系统回收站
-    /// （强制 IFileOperation + FOFX_RECYCLEONDELETE，绝不降级为永久删除）。
+    /// （强制 IFileOperation + FOFX_RECYCLEONDELETE + FOF_ALLOWUNDO + PreDeleteItem 拦截，绝不降级为永久删除）。
     /// </summary>
     public static DeleteOutcome ExecuteSingleRecycle(
         DeleteRequest req,
@@ -362,17 +356,20 @@ public static class DeleteEngine
             return refusedLog;
         }
 
+        string opId = DeleteLog.NewOpId();
+        bool intentWritten = false;
         DeleteOutcome o;
         try
         {
-            o = VerifyAndSingleRecycle(req, allowedScanRoots, customBinOrNull, logPath, batchId);
+            o = VerifyAndSingleRecycle(req, allowedScanRoots, customBinOrNull, logPath, batchId, opId, ref intentWritten);
         }
         catch (Exception ex)
         {
             o = new DeleteOutcome();
             o.Path = req == null ? "" : req.Path;
-            o.OpId = DeleteLog.NewOpId();
+            o.OpId = opId;
             o.Status = DeleteStatus.OutcomeUnknown;
+            o.Dispatch = intentWritten ? DispatchState.Unknown : DispatchState.NotDispatched;
             o.Detail = "单文件移入回收站过程中出现未预期异常（" + ex.GetType().Name + "），"
                      + "无法确认目标状态，请立即检查回收站与原位置。";
         }
@@ -391,65 +388,86 @@ public static class DeleteEngine
         IList<string> allowedScanRoots,
         IRecycleBin customBinOrNull,
         string logPath,
-        string batchId)
+        string batchId,
+        string opId,
+        ref bool intentWritten)
     {
         // ---- 1. 请求有效性：拒绝空请求与任何目录 ----
         if (req == null)
-            return NoDispatch(null, DeleteRefusalKind.NotEligibleAtScan, "单文件回收请求为空，拒绝处理");
+            return NoDispatch(null, opId, DeleteRefusalKind.NotEligibleAtScan, "单文件回收请求为空，拒绝处理");
         if (req.WasDirectory)
-            return NoDispatch(req, DeleteRefusalKind.DirectoryRefused, "目录不允许移入回收站（仅支持单个普通文件）");
+            return NoDispatch(req, opId, DeleteRefusalKind.DirectoryRefused, "目录不允许移入回收站（仅支持单个普通文件）");
 
         // ---- 2. 受保护保留类文件硬拒绝 ----
         if (String.Equals(req.Risk, EvidenceRules.RiskKeep, StringComparison.Ordinal))
-            return NoDispatch(req, DeleteRefusalKind.NotEligibleAtScan,
+            return NoDispatch(req, opId, DeleteRefusalKind.NotEligibleAtScan,
                 "受保护的系统或关键文件（保留类）不允许移入回收站");
 
         if (String.IsNullOrEmpty(req.Path))
-            return NoDispatch(req, DeleteRefusalKind.PathNotCanonical, "目标路径为空，拒绝处理");
+            return NoDispatch(req, opId, DeleteRefusalKind.PathNotCanonical, "目标路径为空，拒绝处理");
 
-        // ---- 3. 范围守卫与重解析点守卫 ----
+        // ---- 3. 范围守卫与全链路重解析点守卫 ----
         if (allowedScanRoots == null || allowedScanRoots.Count == 0)
-            return NoDispatch(req, DeleteRefusalKind.OutOfScope, "未指定有效的扫描根目录范围，拒绝移入回收站");
+            return NoDispatch(req, opId, DeleteRefusalKind.OutOfScope, "未指定有效的扫描根目录范围，拒绝移入回收站");
 
         string target = PathGuard.Canonical(req.Path);
-        if (target.Length == 0 || !Path.IsPathRooted(target))
-            return NoDispatch(req, DeleteRefusalKind.PathNotCanonical, "无法规范化目标路径，拒绝处理");
+        if (target.Length == 0 || !Path.IsPathRooted(target) || !PathGuard.IsLocalDrivePath(target))
+            return NoDispatch(req, opId, DeleteRefusalKind.PathNotCanonical, "无法规范化目标路径或非本地磁盘路径，拒绝处理");
 
         string targetDriveRoot = Path.GetPathRoot(target);
         if (!String.IsNullOrEmpty(targetDriveRoot)
             && String.Equals(target.TrimEnd('\\', '/') + "\\", targetDriveRoot, StringComparison.OrdinalIgnoreCase))
         {
-            return NoDispatch(req, DeleteRefusalKind.DirectoryRefused, "磁盘根目录不允许移入回收站");
+            return NoDispatch(req, opId, DeleteRefusalKind.DirectoryRefused, "磁盘根目录不允许移入回收站");
         }
 
         string matchedRoot = FindMatchingScanRoot(allowedScanRoots, target, true);
         if (matchedRoot.Length == 0)
-            return NoDispatch(req, DeleteRefusalKind.OutOfScope, "目标位于本次扫描范围之外，拒绝移入回收站");
+            return NoDispatch(req, opId, DeleteRefusalKind.OutOfScope, "目标位于本次扫描范围之外，拒绝移入回收站");
 
         if (PathGuard.IsReparsePoint(matchedRoot))
-            return NoDispatch(req, DeleteRefusalKind.ReparseAncestor,
+            return NoDispatch(req, opId, DeleteRefusalKind.ReparseAncestor,
                 "扫描根目录自身为符号链接或重解析点，拒绝移入回收站");
 
         if (PathGuard.HasReparseAncestor(matchedRoot, target))
-            return NoDispatch(req, DeleteRefusalKind.ReparseAncestor,
+            return NoDispatch(req, opId, DeleteRefusalKind.ReparseAncestor,
                 "目标的上级路径中含有符号链接 / 目录联接点 / 卷挂载点，拒绝移入回收站");
+
+        string parentDir = null;
+        try { parentDir = Path.GetDirectoryName(target); }
+        catch { parentDir = null; }
+        if (!String.IsNullOrEmpty(parentDir) && PathGuard.HasAnyReparseComponent(parentDir))
+            return NoDispatch(req, opId, DeleteRefusalKind.ReparseAncestor,
+                "目标从卷根起的上级路径中含有符号链接 / 目录联接点 / 卷挂载点，拒绝移入回收站");
 
         bool existsFile = File.Exists(target);
         bool existsDir = Directory.Exists(target);
         if (!existsFile && !existsDir)
-            return NoDispatch(req, DeleteRefusalKind.Vanished, "目标文件已不存在，未执行任何操作");
+            return NoDispatch(req, opId, DeleteRefusalKind.Vanished, "目标文件已不存在，未执行任何操作");
         if (existsDir || !existsFile)
-            return NoDispatch(req, DeleteRefusalKind.TypeChanged, "目标当前不是普通文件，拒绝移入回收站");
+            return NoDispatch(req, opId, DeleteRefusalKind.TypeChanged, "目标当前不是普通文件，拒绝移入回收站");
         if (PathGuard.IsReparsePoint(target))
-            return NoDispatch(req, DeleteRefusalKind.ReparseTarget, "目标是符号链接或重解析点，拒绝移入回收站");
+            return NoDispatch(req, opId, DeleteRefusalKind.ReparseTarget, "目标是符号链接或重解析点，拒绝移入回收站");
+        if (PathGuard.HasAnyReparseComponent(target))
+            return NoDispatch(req, opId, DeleteRefusalKind.ReparseAncestor, "目标路径链存在重解析点，拒绝移入回收站");
 
-        // ---- 4. 强身份与弱身份复验 + 实时占用探测 + 实时 KEEP-* 规则硬拦截 ----
-        FileIdentity nowId = FileIdentityProbe.Capture(target);
-        if (!nowId.Ok)
-            return NoDispatch(req, DeleteRefusalKind.IdentityUnreadable, "无法取得目标当前的文件标识，拒绝处理");
+        // ---- 4. 句柄级最终路径 + 单硬链接 + 强身份复验 + 弱身份复验 + 实时 KEEP-* 硬拦截 ----
+        FileIdentity nowId;
+        string expectedLongPath;
+        string handleWhy;
+        if (!PermanentDeleteBin.VerifySingleFileHandle(target, out nowId, out expectedLongPath, out handleWhy))
+        {
+            if (handleWhy.IndexOf("硬链接", StringComparison.Ordinal) >= 0)
+                return NoDispatch(req, opId, DeleteRefusalKind.PolicyRecomputeDenied, handleWhy);
+            if (handleWhy.IndexOf("重解析点", StringComparison.Ordinal) >= 0
+                || handleWhy.IndexOf("路径不一致", StringComparison.Ordinal) >= 0)
+                return NoDispatch(req, opId, DeleteRefusalKind.ReparseAncestor, handleWhy);
+            return NoDispatch(req, opId, DeleteRefusalKind.IdentityUnreadable,
+                "无法核验目标文件句柄身份（" + handleWhy + "），拒绝处理");
+        }
 
         if (req.IdAtScan.Ok && !nowId.SameAs(req.IdAtScan))
-            return NoDispatch(req, DeleteRefusalKind.IdentityChanged,
+            return NoDispatch(req, opId, DeleteRefusalKind.IdentityChanged,
                 "目标已被替换（文件标识 " + req.IdAtScan + " → " + nowId + "），已中止");
 
         FileInfo fi;
@@ -457,37 +475,37 @@ public static class DeleteEngine
         {
             fi = new FileInfo(target);
             if (!fi.Exists)
-                return NoDispatch(req, DeleteRefusalKind.Vanished, "目标文件已不存在，未执行任何操作");
+                return NoDispatch(req, opId, DeleteRefusalKind.Vanished, "目标文件已不存在，未执行任何操作");
             if ((fi.Attributes & FileAttributes.Directory) != 0)
-                return NoDispatch(req, DeleteRefusalKind.TypeChanged, "目标已变为目录，拒绝移入回收站");
+                return NoDispatch(req, opId, DeleteRefusalKind.TypeChanged, "目标已变为目录，拒绝移入回收站");
             if ((fi.Attributes & FileAttributes.ReparsePoint) != 0)
-                return NoDispatch(req, DeleteRefusalKind.ReparseTarget, "目标是符号链接或重解析点，拒绝移入回收站");
+                return NoDispatch(req, opId, DeleteRefusalKind.ReparseTarget, "目标是符号链接或重解析点，拒绝移入回收站");
         }
         catch
         {
-            return NoDispatch(req, DeleteRefusalKind.WeakIdentityChanged, "无法读取目标文件当前属性，已中止");
+            return NoDispatch(req, opId, DeleteRefusalKind.WeakIdentityChanged, "无法读取目标文件当前属性，已中止");
         }
 
         if (req.BytesAtScan < 0 || fi.Length != req.BytesAtScan)
-            return NoDispatch(req, DeleteRefusalKind.WeakIdentityChanged,
+            return NoDispatch(req, opId, DeleteRefusalKind.WeakIdentityChanged,
                 "扫描后目标文件大小已发生变化，已中止");
 
         if (req.LastWriteUtcAtScan == DateTime.MinValue
             || Math.Abs((fi.LastWriteTimeUtc - req.LastWriteUtcAtScan).TotalSeconds) > 2.0)
         {
-            return NoDispatch(req, DeleteRefusalKind.WeakIdentityChanged,
+            return NoDispatch(req, opId, DeleteRefusalKind.WeakIdentityChanged,
                 "扫描后目标文件修改时间已发生变化，已中止");
         }
 
         bool nowReadOnly = (fi.Attributes & FileAttributes.ReadOnly) != 0;
         if (nowReadOnly != req.WasReadOnly)
-            return NoDispatch(req, DeleteRefusalKind.WeakIdentityChanged,
+            return NoDispatch(req, opId, DeleteRefusalKind.WeakIdentityChanged,
                 "扫描后目标文件只读属性已发生变化，已中止");
 
         int liveDays = 0;
         try
         {
-            liveDays = (int)(DateTime.Now - fi.LastWriteTime).TotalDays;
+            liveDays = (int)(DateTime.UtcNow - fi.LastWriteTimeUtc).TotalDays;
             if (liveDays < 0) liveDays = 0;
         }
         catch { liveDays = 0; }
@@ -498,14 +516,14 @@ public static class DeleteEngine
                 || (!String.IsNullOrEmpty(liveRule.RuleId)
                     && liveRule.RuleId.StartsWith("KEEP-", StringComparison.OrdinalIgnoreCase))))
         {
-            return NoDispatch(req, DeleteRefusalKind.PolicyRecomputeDenied,
+            return NoDispatch(req, opId, DeleteRefusalKind.PolicyRecomputeDenied,
                 "受保护的系统或关键文件（" + liveRule.RuleId + "：" + liveRule.Reason + "）不允许移入回收站");
         }
 
         LockState ls = LockProbe.Probe(target);
         if (ls != LockState.Free)
         {
-            return NoDispatch(req, DeleteRefusalKind.PolicyRecomputeDenied,
+            return NoDispatch(req, opId, DeleteRefusalKind.PolicyRecomputeDenied,
                 ls == LockState.Occupied
                     ? "该文件正被其他程序占用，无法移入回收站"
                     : "无法确认该文件是否正被使用，拒绝移入回收站");
@@ -513,21 +531,23 @@ public static class DeleteEngine
 
         // ---- 5. 回收站后端与可用性预检（绝不降级为永久删除）----
         if (customBinOrNull is PermanentDeleteBin)
-            return NoDispatch(req, DeleteRefusalKind.GateDisabled, "单文件回收入口严禁使用永久删除后端");
+            return NoDispatch(req, opId, DeleteRefusalKind.GateDisabled, "单文件回收入口严禁使用永久删除后端");
 
-        IRecycleBin bin = customBinOrNull != null ? customBinOrNull : WindowsRecycleBin.CreateForSingleFile();
+        IRecycleBin bin = customBinOrNull != null
+            ? customBinOrNull
+            : WindowsRecycleBin.CreateForSingleFile(expectedLongPath, nowId);
         string availWhy;
         DeleteRefusalKind ck;
         if (!bin.IsAvailable(target, fi.Length, true, out availWhy, out ck))
         {
-            return NoDispatch(req, ck == DeleteRefusalKind.None ? DeleteRefusalKind.CapacityUnknown : ck,
+            return NoDispatch(req, opId, ck == DeleteRefusalKind.None ? DeleteRefusalKind.CapacityUnknown : ck,
                 "系统回收站预检未通过（为避免直接永久删除已拒绝操作）：" + availWhy);
         }
 
         // ---- 6. 审计日志 intent 先行 ----
         DeleteOutcome o = new DeleteOutcome();
         o.Path = req.Path;
-        o.OpId = DeleteLog.NewOpId();
+        o.OpId = opId;
 
         DeleteRequest intentReq = new DeleteRequest();
         intentReq.Path = req.Path;
@@ -542,9 +562,10 @@ public static class DeleteEngine
         string intentWhy;
         if (!DeleteLog.WriteIntent(logPath, o.OpId, batchId, intentReq, target, out intentWhy))
         {
-            return NoDispatch(req, DeleteRefusalKind.LogUnwritable,
+            return NoDispatch(req, opId, DeleteRefusalKind.LogUnwritable,
                 "审计日志写入 intent 失败，已拒绝派发操作（" + intentWhy + "）。未执行任何操作。");
         }
+        intentWritten = true;
 
         // ---- 7. 派发与事后核验 ----
         o.Dispatch = DispatchState.Dispatched;
@@ -612,77 +633,93 @@ public static class DeleteEngine
 
     private static DeleteOutcome VerifyAndDelete(DeleteRequest r, IList<string> scanRoots,
                                                  IRecycleBin bin, string logPath, string batchId,
-                                                 DeleteLog.WriterSession logSession)
+                                                 DeleteLog.WriterSession logSession,
+                                                 string opId, ref bool intentWritten)
     {
+        if (r == null)
+            return NoDispatch(null, opId, DeleteRefusalKind.NotEligibleAtScan, "删除请求为空，拒绝处理");
+
         DeleteOutcome o = new DeleteOutcome();
         o.Path = r.Path;
-        o.OpId = DeleteLog.NewOpId();
+        o.OpId = opId;
 
         // ---- 0. 运行期闸门：永久删除走独立闸门；回收站走旧闸门（编译期常量仍为 false）----
         if (!AllowsBackend(bin))
-            return NoDispatch(r, DeleteRefusalKind.GateDisabled, DisabledReason);
+            return NoDispatch(r, opId, DeleteRefusalKind.GateDisabled, DisabledReason);
 
         // ---- 1. 扫描阶段的授权结论必须为 true（前置条件，非依据）----
         if (!r.PolicyEligible)
-            return NoDispatch(r, DeleteRefusalKind.NotEligibleAtScan,
+            return NoDispatch(r, opId, DeleteRefusalKind.NotEligibleAtScan,
                 "该项目未通过删除授权（分级：" + r.Risk + "）");
 
-        // ---- 2. 范围：必须在扫描根之内，且祖先链没有重解析点 ----
-        string matchedRoot = FindMatchingScanRoot(scanRoots, r.Path, false);
+        // MSDN 事实：pFrom 不是完整路径时，即使设了 FOF_ALLOWUNDO 也不会进回收站
+        // （会被静默永久删除）。因此实际调用一律使用规范化后的本地绝对路径。
+        string target = PathGuard.Canonical(r.Path);
+        if (target.Length == 0 || !Path.IsPathRooted(target) || !PathGuard.IsLocalDrivePath(target))
+            return NoDispatch(r, opId, DeleteRefusalKind.PathNotCanonical, "无法规范化目标路径或非本地磁盘路径，拒绝处理");
+
+        // ---- 2. 范围：必须在扫描根之内，且扫描根自身及从卷根起的整条祖先链均无重解析点 ----
+        string matchedRoot = FindMatchingScanRoot(scanRoots, target, false);
         if (matchedRoot.Length == 0)
-            return NoDispatch(r, DeleteRefusalKind.OutOfScope, "目标位于扫描根目录之外");
-        if (PathGuard.HasReparseAncestor(matchedRoot, r.Path))
-            return NoDispatch(r, DeleteRefusalKind.ReparseAncestor,
+            return NoDispatch(r, opId, DeleteRefusalKind.OutOfScope, "目标位于扫描根目录之外");
+        if (PathGuard.IsReparsePoint(matchedRoot))
+            return NoDispatch(r, opId, DeleteRefusalKind.ReparseAncestor,
+                "扫描根目录自身为符号链接或重解析点，拒绝处理");
+        if (PathGuard.HasReparseAncestor(matchedRoot, target))
+            return NoDispatch(r, opId, DeleteRefusalKind.ReparseAncestor,
                 "目标的上级路径中含有符号链接 / 目录联接点 / 卷挂载点");
 
-        // MSDN 事实：pFrom 不是完整路径时，即使设了 FOF_ALLOWUNDO 也不会进回收站
-        // （会被静默永久删除）。因此实际调用一律使用规范化后的绝对路径。
-        string target = PathGuard.Canonical(r.Path);
-        if (target.Length == 0 || !Path.IsPathRooted(target))
-            return NoDispatch(r, DeleteRefusalKind.PathNotCanonical, "无法规范化目标路径，拒绝处理");
+        string parentDir = null;
+        try { parentDir = Path.GetDirectoryName(target); }
+        catch { parentDir = null; }
+        if (!String.IsNullOrEmpty(parentDir) && PathGuard.HasAnyReparseComponent(parentDir))
+            return NoDispatch(r, opId, DeleteRefusalKind.ReparseAncestor,
+                "目标从卷根起的上级路径中含有符号链接 / 目录联接点 / 卷挂载点");
 
         // ---- 3. 存在性与类型 ----
         bool existsFile = File.Exists(target);
         bool existsDir = Directory.Exists(target);
         if (!existsFile && !existsDir)
-            return NoDispatch(r, DeleteRefusalKind.Vanished, "目标已不存在，未执行任何删除");
+            return NoDispatch(r, opId, DeleteRefusalKind.Vanished, "目标已不存在，未执行任何删除");
         if (existsDir != r.WasDirectory)
-            return NoDispatch(r, DeleteRefusalKind.TypeChanged,
+            return NoDispatch(r, opId, DeleteRefusalKind.TypeChanged,
                 "目标类型已改变（扫描时是" + (r.WasDirectory ? "目录" : "文件") + "）");
 
-        // ---- 4. 目标自身不得是重解析点 ----
+        // ---- 4. 目标自身及整条路径不得含重解析点 ----
         if (PathGuard.IsReparsePoint(target))
-            return NoDispatch(r, DeleteRefusalKind.ReparseTarget,
+            return NoDispatch(r, opId, DeleteRefusalKind.ReparseTarget,
                 "目标是符号链接 / 目录联接点，拒绝处理");
+        if (PathGuard.HasAnyReparseComponent(target))
+            return NoDispatch(r, opId, DeleteRefusalKind.ReparseAncestor,
+                "目标路径链含有符号链接 / 目录联接点，拒绝处理");
 
         // ---- 5. 非空目录不得递归删除 ----
         if (existsDir && !DirScan.IsEmptyDirectory(target))
-            return NoDispatch(r, DeleteRefusalKind.NonEmptyDirectory,
+            return NoDispatch(r, opId, DeleteRefusalKind.NonEmptyDirectory,
                 "非空目录禁止递归删除（当前版本未逐项核验目录内容）");
 
         // ---- 6. 身份（强）：卷号 + 文件索引 ----
         FileIdentity nowId = FileIdentityProbe.Capture(target);
         if (!nowId.Ok)
-            return NoDispatch(r, DeleteRefusalKind.IdentityUnreadable, "无法取得目标的文件标识，拒绝处理");
+            return NoDispatch(r, opId, DeleteRefusalKind.IdentityUnreadable, "无法取得目标的文件标识，拒绝处理");
         if (!r.IdAtScan.Ok)
-            return NoDispatch(r, DeleteRefusalKind.IdentityUnreadable, "扫描时未记录目标的文件标识，拒绝处理");
+            return NoDispatch(r, opId, DeleteRefusalKind.IdentityUnreadable, "扫描时未记录目标的文件标识，拒绝处理");
         if (!nowId.SameAs(r.IdAtScan))
-            return NoDispatch(r, DeleteRefusalKind.IdentityChanged,
+            return NoDispatch(r, opId, DeleteRefusalKind.IdentityChanged,
                 "目标已被替换（文件标识 " + r.IdAtScan + " → " + nowId + "），已中止");
 
         // ---- 7. 辅助身份（大小 / 时间 / 只读位）----
         string weak = WeakIdentityChanged(r, target, existsDir, existsFile);
         if (weak.Length > 0)
-            return NoDispatch(r, DeleteRefusalKind.WeakIdentityChanged,
+            return NoDispatch(r, opId, DeleteRefusalKind.WeakIdentityChanged,
                 "扫描后目标已发生变化（" + weak + "），已中止");
 
         // ---- 8. 构造“当下事实”（供重算与容量预检用）----
         ScanItem live = BuildLiveItem(r, target, existsDir, existsFile);
 
-        // ---- 8b. 体积不完整 ⇒ 拒绝（新增）----
-        // 下界不得当上限用：路径体积不完整时，配额判断与“已分析体积”都不可信。
+        // ---- 8b. 体积不完整 ⇒ 拒绝 ----
         if (!live.SizeComplete)
-            return NoDispatch(r, DeleteRefusalKind.DirSizeIncomplete,
+            return NoDispatch(r, opId, DeleteRefusalKind.DirSizeIncomplete,
                 "目标体积不完整（只得到已知下界），无法可靠判断回收站容量，已中止");
 
         // ---- 9. 执行层独立重算授权（不信任快照，不信任 UI）----
@@ -691,17 +728,17 @@ public static class DeleteEngine
         if (!fresh.PolicyEligible)
         {
             DeleteRefusalKind k = existsDir ? DeleteRefusalKind.DirectoryRefused : DeleteRefusalKind.PolicyRecomputeDenied;
-            return NoDispatch(r, k, "执行层重新判定未通过授权：" + fresh.DenyReason);
+            return NoDispatch(r, opId, k, "执行层重新判定未通过授权：" + fresh.DenyReason);
         }
         if (fresh.Risk != r.Risk)
-            return NoDispatch(r, DeleteRefusalKind.RiskChanged,
+            return NoDispatch(r, opId, DeleteRefusalKind.RiskChanged,
                 "执行层重新判定的类别与扫描时不一致（" + r.Risk + " → " + fresh.Risk + "），已中止");
 
-        // ---- 10. 回收站可用性 / 容量（**必要非充分**；绝不降级为永久删除）----
+        // ---- 10. 回收站可用性 / 容量（必要非充分；绝不降级为永久删除）----
         string why;
         DeleteRefusalKind ck;
         if (!bin.IsAvailable(target, live.Bytes, live.SizeComplete, out why, out ck))
-            return NoDispatch(r, ck == DeleteRefusalKind.None ? DeleteRefusalKind.CapacityUnknown : ck,
+            return NoDispatch(r, opId, ck == DeleteRefusalKind.None ? DeleteRefusalKind.CapacityUnknown : ck,
                 "回收站预检未通过（容量判断是必要条件，不等于保证能回收）：" + why);
 
         // ---- 11. intent 先行：写不下去就不许动手 ----
@@ -710,20 +747,20 @@ public static class DeleteEngine
             ? logSession.WriteIntent(o.OpId, batchId, r, target, out intentWhy)
             : DeleteLog.WriteIntent(logPath, o.OpId, batchId, r, target, out intentWhy);
         if (!intentOk)
-            return NoDispatch(r, DeleteRefusalKind.LogUnwritable,
+            return NoDispatch(r, opId, DeleteRefusalKind.LogUnwritable,
                 "审计日志写入 intent 失败，已拒绝派发操作（" + intentWhy + "）。未执行任何操作。");
+        intentWritten = true;
 
         // ---- 12. 派发 ----
         o.Dispatch = DispatchState.Dispatched;
         if (bin is PermanentDeleteBin)
         {
-            // 只删文件；目录在前置中已被拒。同一句柄核对身份后删除。
-            // 最终核对全部在独占删除句柄上完成：身份、大小、修改时间，以及按同一规则重新校验内容。
+            // 只删文件；目录在前置中已被拒。同一句柄核对最终路径、身份、大小、时间与内容后删除。
             string rule = fresh.RuleId;
             string refused = existsDir ? "目录不做永久删除" : PermanentDeleteBin.DeleteVerified(target, nowId,
-                r.BytesAtScan, r.LastWriteUtcAtScan, st => ContentVerifier.VerifyOpenStream(rule, target, st));
+                r.BytesAtScan, r.LastWriteUtcAtScan, delegate(Stream st) { return ContentVerifier.VerifyOpenStream(rule, target, st); });
             bool gone = !File.Exists(target) && !Directory.Exists(target);
-            if (refused == null && gone) { o.Status = DeleteStatus.DeletedVerified; o.Detail = "已永久删除（不可恢复）；删除前已在同一句柄上核对身份、大小、时间与内容"; }
+            if (refused == null && gone) { o.Status = DeleteStatus.DeletedVerified; o.Detail = "已永久删除（不可恢复）；删除前已在同一句柄上核对最终路径、身份、大小、时间与内容"; }
             else if (refused != null && !gone)
             {
                 FileIdentity after = FileIdentityProbe.Capture(target);
@@ -746,10 +783,6 @@ public static class DeleteEngine
         }
 
         // ---- 13. 分类：只看实测事实 + 源是否仍在 + 身份复验 ----
-        // 铁律：
-        //   * “HRESULT 成功”不是回收证据；
-        //   * “原路径消失”不是回收证据；
-        //   * 结果不明 ⇒ 不报成功，且停止后续（o.NeedsUrgentReview 为 true）。
         bool stillThere = File.Exists(target) || Directory.Exists(target);
         bool identitySame = false;
         if (stillThere)
@@ -768,9 +801,14 @@ public static class DeleteEngine
     /// <summary>构造“未派发就被拒绝”的结果（所有前置拒绝路径都走这里，保证 WasDispatched=false）。</summary>
     private static DeleteOutcome NoDispatch(DeleteRequest r, DeleteRefusalKind kind, string detail)
     {
+        return NoDispatch(r, DeleteLog.NewOpId(), kind, detail);
+    }
+
+    private static DeleteOutcome NoDispatch(DeleteRequest r, string opId, DeleteRefusalKind kind, string detail)
+    {
         DeleteOutcome o = new DeleteOutcome();
         o.Path = r == null ? "" : r.Path;
-        o.OpId = DeleteLog.NewOpId();
+        o.OpId = String.IsNullOrEmpty(opId) ? DeleteLog.NewOpId() : opId;
         o.Status = DeleteStatus.RefusedNotDispatched;
         o.Kind = kind;
         o.Dispatch = DispatchState.NotDispatched;
@@ -795,7 +833,21 @@ public static class DeleteEngine
     public static List<DeleteOutcome> Reconcile(string logPath)
     {
         List<DeleteOutcome> list = new List<DeleteOutcome>();
-        foreach (KeyValuePair<string, string> kv in DeleteLog.PendingOps(logPath))
+        List<KeyValuePair<string, string>> pending;
+        string err;
+        if (!DeleteLog.TryPendingOps(logPath, out pending, out err))
+        {
+            DeleteOutcome failed = new DeleteOutcome();
+            failed.OpId = "audit-log-unreadable";
+            failed.Path = logPath ?? "";
+            failed.Status = DeleteStatus.PendingReconciliation;
+            failed.Dispatch = DispatchState.Unknown;
+            failed.Detail = "审计日志不可读：" + (String.IsNullOrEmpty(err) ? "未知错误" : err);
+            list.Add(failed);
+            return list;
+        }
+        if (pending == null) return list;
+        foreach (KeyValuePair<string, string> kv in pending)
         {
             DeleteOutcome o = new DeleteOutcome();
             o.OpId = kv.Key;
@@ -810,7 +862,6 @@ public static class DeleteEngine
         }
         return list;
     }
-
 
     private static ScanItem BuildLiveItem(DeleteRequest r, string target, bool existsDir, bool existsFile)
     {
@@ -833,7 +884,7 @@ public static class DeleteEngine
                 FileInfo fi = new FileInfo(target);
                 live.Bytes = fi.Length;
                 live.LastWriteUtc = fi.LastWriteTimeUtc;
-                live.Days = (int)(DateTime.Now - fi.LastWriteTime).TotalDays;
+                live.Days = (int)(DateTime.UtcNow - fi.LastWriteTimeUtc).TotalDays;
                 if (live.Days < 0) live.Days = 0;
             }
             catch { live.SizeComplete = false; }
@@ -866,9 +917,9 @@ public static class DeleteEngine
     /// <summary>
     /// 安全移除缓存清理后遗留的空壳子目录（100% Fail-Safe）：
     ///   * 仅处理某个 stopRoot 严格内部（真子目录层级）的已删文件祖先目录，绝不触碰 stopRoot 本身；
-    ///   * 绝不删除磁盘根目录、%TEMP%、%LOCALAPPDATA%\Temp、%WINDIR%\Temp、%WINDIR%\SoftwareDistribution\Download 等根；
-    ///   * 跳过重解析点与含重解析点祖先的路径；
-    ///   * 仅调用非递归 Directory.Delete(dir, false)，只要目录中仍存任意 1 个文件或被进程占用即由 OS 原子拒绝。
+    ///   * 绝不删除磁盘根目录、系统关键目录、Users 目录、所有已知缓存根及其受保护根目录；
+    ///   * 校验 stopRoot 与 dir 全链路无重解析点；
+    ///   * 使用句柄级核验 TryDeleteEmptyDirVerified(dir) 消除 TOCTOU，非空或被占用由 OS 原子拒绝。
     /// </summary>
     public static int PruneEmptyParentDirs(IEnumerable<string> deletedFilePaths, string[] stopRoots)
     {
@@ -880,7 +931,8 @@ public static class DeleteEngine
         for (int i = 0; i < stopRoots.Length; i++)
         {
             string norm = NormalizeRootForScope(stopRoots[i]);
-            if (norm.Length == 0) continue;
+            if (norm.Length == 0 || !PathGuard.IsLocalDrivePath(norm)) continue;
+            if (PathGuard.HasAnyReparseComponent(norm)) continue;
             if (seenStopRoots.Add(norm))
             {
                 cleanStopRoots.Add(norm);
@@ -896,7 +948,7 @@ public static class DeleteEngine
         {
             if (String.IsNullOrEmpty(rawFile)) continue;
             string canonFile = NormalizeRootForScope(rawFile);
-            if (canonFile.Length == 0 || IsDriveRoot(canonFile)) continue;
+            if (canonFile.Length == 0 || IsDriveRoot(canonFile) || !PathGuard.IsLocalDrivePath(canonFile)) continue;
 
             string matchedRoot = FindMatchingScanRoot(cleanStopRoots, canonFile, true);
             if (matchedRoot.Length == 0) continue;
@@ -928,22 +980,19 @@ public static class DeleteEngine
         for (int i = 0; i < candidates.Count; i++)
         {
             string dir = candidates[i];
-            if (IsDriveRoot(dir) || neverPruneDirs.Contains(dir)) continue;
+            if (IsDriveRoot(dir) || neverPruneDirs.Contains(dir) || !PathGuard.IsLocalDrivePath(dir)) continue;
 
             string stopRoot = FindMatchingScanRoot(cleanStopRoots, dir, true);
             if (stopRoot.Length == 0) continue;
+            if (PathGuard.HasAnyReparseComponent(stopRoot)) continue;
             if (!Directory.Exists(dir)) continue;
             if (PathGuard.IsReparsePoint(dir)) continue;
             if (PathGuard.HasReparseAncestor(stopRoot, dir)) continue;
+            if (PathGuard.HasAnyReparseComponent(dir)) continue;
 
-            try
+            if (PermanentDeleteBin.TryDeleteEmptyDirVerified(dir))
             {
-                Directory.Delete(dir, false);
                 pruned++;
-            }
-            catch
-            {
-                // 目录非空、含受保护/隐藏文件或被占用时，系统原子拒绝删除，静默保留。
             }
         }
         return pruned;
@@ -981,16 +1030,37 @@ public static class DeleteEngine
                 AddProtectedDir(set, Path.Combine(winDir, "Temp"));
                 AddProtectedDir(set, Path.Combine(winDir, "SoftwareDistribution"));
                 AddProtectedDir(set, Path.Combine(winDir, "SoftwareDistribution", "Download"));
+                string winDrive = Path.GetPathRoot(winDir);
+                if (!String.IsNullOrEmpty(winDrive))
+                {
+                    AddProtectedDir(set, Path.Combine(winDrive, "Users"));
+                }
             }
         }
         catch { }
 
+        try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)); } catch { }
+        try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)); } catch { }
+        try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.System)); } catch { }
+        try { AddProtectedDir(set, Environment.SystemDirectory); } catch { }
         try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)); } catch { }
         try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)); } catch { }
         try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData)); } catch { }
         try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)); } catch { }
         try { AddProtectedDir(set, Environment.GetFolderPath(Environment.SpecialFolder.Desktop)); } catch { }
         try { AddProtectedDir(set, AppDataPaths.Root); } catch { }
+        try
+        {
+            string[] knownCacheDirs = CacheRoots.ScanDirectories();
+            if (knownCacheDirs != null)
+            {
+                for (int i = 0; i < knownCacheDirs.Length; i++)
+                {
+                    AddProtectedDir(set, knownCacheDirs[i]);
+                }
+            }
+        }
+        catch { }
         return set;
     }
 

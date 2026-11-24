@@ -11,7 +11,10 @@ function noFallback(){assert(!fs.existsSync(forbidden),'external profile folder 
 const env={...process.env,WEBVIEW2_USER_DATA_FOLDER:forbidden,PORTABLE_FORBIDDEN_PROFILE:forbidden};
 try{
  setup(first);
- const csc='C:/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe';
+ const sysRoot=process.env.SystemRoot||'C:\\Windows';
+ const csc64=path.join(sysRoot,'Microsoft.NET','Framework64','v4.0.30319','csc.exe');
+ const csc32=path.join(sysRoot,'Microsoft.NET','Framework','v4.0.30319','csc.exe');
+ const csc=fs.existsSync(csc64)?csc64:csc32;
  cp.execFileSync(csc,['-nologo','-codepage:65001','-target:exe','-out:'+path.join(first,'AnPingPortableDataProbe.exe'),...['System.Windows.Forms.dll','System.Drawing.dll','System.Web.Extensions.dll',path.join(root,'can-i-delete.exe'),path.join(root,'lib/Microsoft.Web.WebView2.Core.dll'),path.join(root,'lib/Microsoft.Web.WebView2.WinForms.dll')].map(r=>'-r:'+r),path.join(root,'tools/AnPingPortableDataProbe.cs')],{cwd:root,stdio:'inherit',timeout:20000});
  if(!failuresOnly){
   console.log(run(path.join(first,'AnPingPortableDataProbe.exe'),['first'],{env}));noFallback();
@@ -25,18 +28,8 @@ try{
  fs.writeFileSync(path.join(blocked,'data'),'generated path blocker');
  console.log(run(path.join(blocked,'AnPingPortableDataProbe.exe'),['blocked'],{env}));noFallback();assert.equal(fs.readFileSync(path.join(blocked,'data'),'utf8'),'generated path blocker');
  setup(denied);fs.copyFileSync(path.join(moved,'AnPingPortableDataProbe.exe'),path.join(denied,'AnPingPortableDataProbe.exe'));fs.mkdirSync(path.join(denied,'data'));
- // Restrict only the generated test directory, restoring its ACL even when the child fails.
- const aclScript=`$ErrorActionPreference='Stop'
-$p=$env:PORTABLE_DENIED_DATA
-$original=[System.IO.Directory]::GetAccessControl($p)
-$copy=[System.IO.Directory]::GetAccessControl($p)
-$rule=New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User,[System.Security.AccessControl.FileSystemRights]::Write,[System.Security.AccessControl.AccessControlType]::Deny)
-$copy.AddAccessRule($rule)
-try { [System.IO.Directory]::SetAccessControl($p, $copy); & $env:PORTABLE_DENIED_EXE blocked; if ($LASTEXITCODE -ne 0) { throw 'denied-path native probe failed' } }
-finally { [System.IO.Directory]::SetAccessControl($p, $original) }
-`;
- const acl=path.join(out,'deny-generated-data.ps1');fs.writeFileSync(acl,aclScript);
- console.log(run('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',acl],{env:{...env,PORTABLE_DENIED_DATA:path.join(denied,'data'),PORTABLE_DENIED_EXE:path.join(denied,'AnPingPortableDataProbe.exe')}}));noFallback();
+ // Restrict only the generated test directory natively via .NET DirectorySecurity inside the probe, restoring its ACL in finally.
+ console.log(run(path.join(denied,'AnPingPortableDataProbe.exe'),['denied'],{env}));noFallback();
  const checks=['file blocker rejected without UI','write-denied rejected without UI','no AppData fallback'];
  if(!failuresOnly)checks.unshift('different cwd','restart','folder relocation with settings','profile env override');
  fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({passed:true,checks,appDataExisted:baseline},null,2));

@@ -1,32 +1,28 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 // =====================================================================
-// 回收站后端（IFileOperation + FOFX_RECYCLEONDELETE）
+// 回收站后端（IFileOperation + FOFX_RECYCLEONDELETE + FOF_ALLOWUNDO）
 //
 // 为什么换掉 Microsoft.VisualBasic.FileIO：
 //   那条路最终走 SHFileOperation，框架标志里**从不设置 FOF_WANTNUKEWARNING**，
 //   拿不到“逐项同步”的回收证据，只能事后扫 $I/$R 反推。
-//   IFileOperation 的 PostDeleteItem 会同步给出 psiNewlyCreated：
-//     * psiNewlyCreated != NULL  ⇒ 该项确实作为新对象被创建（即进了回收站）
-//     * psiNewlyCreated == NULL  ⇒ 没有创建新对象
+//   IFileOperation 的 PreDeleteItem 可在 Shell 决定静默永久删除前用
+//   TSF_DELETE_RECYCLE_IF_POSSIBLE 与目标强身份拦截；PostDeleteItem 会同步给出
+//   psiNewlyCreated：
+//     * psiNewlyCreated != NULL 且落入 \$Recycle.Bin\ ⇒ 该项确实作为新对象被创建（即进了回收站）
+//     * psiNewlyCreated == NULL ⇒ 没有创建新对象
 //
-// ⚠ 本机实测（E:\cid-host-recycle-test-18e1f068）确认的两条限制，必须随代码传递：
+// ⚠ 本机实测确认的两条限制，必须随代码传递：
 //   1. psiNewlyCreated == NULL **不能**单独证明永久删除 ——
 //      用 PreDeleteItem 返回 ERROR_CANCELLED 取消时，PostDeleteItem 仍会回调，
 //      psiNewlyCreated 也是 NULL，但文件根本没被删。
 //      ⇒ 分类必须结合“源文件是否仍在”。
 //   2. GetAnyOperationsAborted 在确实被取消时仍可能返回 false，
 //      因此**不能**用它当“是否取消”的判据。
-//
-// ⚠ 仍未验证：不可回收情形（超配额 / 回收站被禁用 / 非固定卷）下
-//   psiNewlyCreated 是否可靠地为 NULL。**在那之前不得声称已完成该项证明。**
-//   本文件因此在“源已消失但没有回收证据”时一律返回 OutcomeUnknown，
-//   绝不当作成功，也绝不当作安全。
-//
-// COM 声明与 vtable 顺序取自 tests/vm/ifoop.cs —— 那一套已在本机
-// 经 --vtablescan（槽位 8–18 空参调用全部失败、无一个 S_OK）与真实回收实验验证过。
 // =====================================================================
 
 internal static class ShellRecycle
@@ -106,16 +102,24 @@ internal static class ShellRecycle
     }
 
     /// <summary>
-    /// 生产标志集合（与实验验证过的一致，0x00180410）：
-    ///   FOFX_RECYCLEONDELETE  0x00080000  —— 要求送进回收站（在 Win8+ 隐含 FOF_ALLOWUNDO）
+    /// 生产标志集合（0x00180450）：
+    ///   FOFX_RECYCLEONDELETE  0x00080000  —— 要求送进回收站
     ///   FOFX_EARLYFAILURE     0x00100000  —— 第一项失败即中止，不做半成品
     ///   FOF_NOERRORUI         0x00000400  —— 不显示错误弹窗
+    ///   FOF_ALLOWUNDO         0x00000040  —— 显式保留可撤销回收语义（兼容全版本 Windows）
     ///   FOF_NOCONFIRMATION    0x00000010  —— 不弹确认
     /// ⚠ 刻意**不含** FOF_WANTNUKEWARNING：它是警告机制而非保证，
-    ///   且在当前静默上下文中可能造成无 UI 的阻塞。这条限制已记录在案。
+    ///   且在当前静默上下文中可能造成无 UI 的阻塞；静默永久删除拦截由 PreDeleteItem 强制执行。
     /// </summary>
-    internal const uint Flags = 0x00080000u | 0x00100000u | 0x00000400u | 0x00000010u;
+    internal const uint FOF_NOCONFIRMATION = 0x00000010u;
+    internal const uint FOF_ALLOWUNDO = 0x00000040u;
+    internal const uint FOF_NOERRORUI = 0x00000400u;
+    internal const uint FOFX_RECYCLEONDELETE = 0x00080000u;
+    internal const uint FOFX_EARLYFAILURE = 0x00100000u;
+    internal const uint Flags = FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NOERRORUI | FOF_ALLOWUNDO | FOF_NOCONFIRMATION;
 
+    internal const uint TSF_DELETE_RECYCLE_IF_POSSIBLE = 0x0080u;
+    internal const int HR_ERROR_CANCELLED = unchecked((int)0x800704C7);
     internal const uint SIGDN_DESKTOPABSOLUTEPARSING = 0x80028000;
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
@@ -137,7 +141,7 @@ internal static class ShellRecycle
         try
         {
             string s;
-            return it.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, out s) >= 0 ? s : "";
+            return it.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, out s) >= 0 ? (s ?? "") : "";
         }
         catch { return ""; }
     }
@@ -162,20 +166,32 @@ public sealed class RecycleEvidence
 
     public bool CancelledBeforeDispatch
     {
-        get { return PostDeleteItemFired && HrDelete == unchecked((int)0x800704C7); }   // ERROR_CANCELLED
+        get { return PostDeleteItemFired && HrDelete == ShellRecycle.HR_ERROR_CANCELLED; }
     }
 }
 
 /// <summary>
-/// 进度回调：只**记录**事实，不做任何判断，也不吞掉操作。
+/// 进度回调：在 PreDeleteItem 强制拦住 Shell 静默永久删除与路径/身份调包；
+/// 在 PostDeleteItem 严格记录回收证据。
 /// </summary>
 internal sealed class RecycleSink : ShellRecycle.IFileOperationProgressSink
 {
+    private readonly string expectedLongPath;
+    private readonly FileIdentity expectedId;
+    private readonly bool enforceIdentity;
+
     public int PostDeleteItemCount;
     public int StartCalls, FinishCalls;
     public int HrDelete;
     public bool NewlyCreatedPresent;
     public string RecycledTo = "";
+
+    public RecycleSink(string expectedLongPath, FileIdentity expectedId, bool enforceIdentity)
+    {
+        this.expectedLongPath = expectedLongPath ?? "";
+        this.expectedId = expectedId;
+        this.enforceIdentity = enforceIdentity;
+    }
 
     public int StartOperations() { StartCalls++; return 0; }
     public int FinishOperations(int hrResult) { FinishCalls++; return 0; }
@@ -185,15 +201,65 @@ internal sealed class RecycleSink : ShellRecycle.IFileOperationProgressSink
     public int PostMoveItem(uint flags, ShellRecycle.IShellItem psi, ShellRecycle.IShellItem dest, string newName, int hr, ShellRecycle.IShellItem created) { return 0; }
     public int PreCopyItem(uint flags, ShellRecycle.IShellItem psi, ShellRecycle.IShellItem dest, string newName) { return 0; }
     public int PostCopyItem(uint flags, ShellRecycle.IShellItem psi, ShellRecycle.IShellItem dest, string newName, int hr, ShellRecycle.IShellItem created) { return 0; }
-    public int PreDeleteItem(uint flags, ShellRecycle.IShellItem psi) { return 0; }
+
+    public int PreDeleteItem(uint flags, ShellRecycle.IShellItem psi)
+    {
+        try
+        {
+            // 若 Shell 未携带 TSF_DELETE_RECYCLE_IF_POSSIBLE（0x0080），说明其准备永久删除，立即取消。
+            if ((flags & ShellRecycle.TSF_DELETE_RECYCLE_IF_POSSIBLE) == 0)
+                return ShellRecycle.HR_ERROR_CANCELLED;
+
+            if (psi == null) return ShellRecycle.HR_ERROR_CANCELLED;
+
+            string displayPath = ShellRecycle.Display(psi);
+            if (String.IsNullOrEmpty(displayPath) || !PathGuard.IsLocalDrivePath(displayPath))
+                return ShellRecycle.HR_ERROR_CANCELLED;
+            if (PathGuard.HasAnyReparseComponent(displayPath))
+                return ShellRecycle.HR_ERROR_CANCELLED;
+
+            FileIdentity liveId;
+            string liveLong;
+            string why;
+            if (!PermanentDeleteBin.VerifySingleFileHandle(displayPath, out liveId, out liveLong, out why))
+                return ShellRecycle.HR_ERROR_CANCELLED;
+
+            if (expectedLongPath.Length > 0
+                && !String.Equals(liveLong, expectedLongPath, StringComparison.OrdinalIgnoreCase))
+                return ShellRecycle.HR_ERROR_CANCELLED;
+
+            if (enforceIdentity && (!expectedId.Ok || !liveId.SameAs(expectedId)))
+                return ShellRecycle.HR_ERROR_CANCELLED;
+
+            return 0;
+        }
+        catch
+        {
+            return ShellRecycle.HR_ERROR_CANCELLED;
+        }
+    }
+
     public int PostDeleteItem(uint flags, ShellRecycle.IShellItem psi, int hrDelete, ShellRecycle.IShellItem psiNewlyCreated)
     {
         PostDeleteItemCount++;
-        HrDelete = hrDelete;
-        NewlyCreatedPresent = psiNewlyCreated != null;
-        RecycledTo = NewlyCreatedPresent ? ShellRecycle.Display(psiNewlyCreated) : "";
+        if (PostDeleteItemCount == 1)
+        {
+            HrDelete = hrDelete;
+            string recycledPath = psiNewlyCreated != null ? ShellRecycle.Display(psiNewlyCreated) : "";
+            RecycledTo = recycledPath;
+            NewlyCreatedPresent = (hrDelete >= 0)
+                && (psiNewlyCreated != null)
+                && !String.IsNullOrEmpty(recycledPath)
+                && recycledPath.IndexOf("\\$Recycle.Bin\\", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        else
+        {
+            // 单文件回收绝不应触发多次 PostDeleteItem，若异常触发则保守判为无有效回收证据。
+            NewlyCreatedPresent = false;
+        }
         return 0;
     }
+
     public int PreNewItem(uint flags, ShellRecycle.IShellItem dest, string newName) { return 0; }
     public int PostNewItem(uint flags, ShellRecycle.IShellItem dest, string newName, string tmpl, uint attrs, int hrNew, ShellRecycle.IShellItem newItem) { return 0; }
     public int UpdateProgress(uint workTotal, uint workSoFar) { return 0; }
@@ -203,7 +269,7 @@ internal sealed class RecycleSink : ShellRecycle.IFileOperationProgressSink
 }
 
 /// <summary>
-/// 真实回收站后端：IFileOperation + FOFX_RECYCLEONDELETE。
+/// 真实回收站后端：IFileOperation + FOFX_RECYCLEONDELETE + FOF_ALLOWUNDO。
 /// **只处理普通文件**；目录在接口层就没有入口（不提供 SendDirectory）。
 /// </summary>
 public sealed class WindowsRecycleBin : IRecycleBin
@@ -220,15 +286,21 @@ public sealed class WindowsRecycleBin : IRecycleBin
     public static int RealGateBypasses;
 
     private int singleFileQuota;
+    private readonly string expectedLongPath;
+    private readonly FileIdentity expectedId;
+    private readonly bool hasExpectedIdentity;
 
     public WindowsRecycleBin()
+        : this(0, "", default(FileIdentity), false)
     {
-        this.singleFileQuota = 0;
     }
 
-    private WindowsRecycleBin(int singleFileQuota)
+    private WindowsRecycleBin(int singleFileQuota, string expectedLongPath, FileIdentity expectedId, bool hasExpectedIdentity)
     {
         this.singleFileQuota = singleFileQuota;
+        this.expectedLongPath = expectedLongPath ?? "";
+        this.expectedId = expectedId;
+        this.hasExpectedIdentity = hasExpectedIdentity;
     }
 
     /// <summary>
@@ -238,7 +310,12 @@ public sealed class WindowsRecycleBin : IRecycleBin
     /// </summary>
     internal static WindowsRecycleBin CreateForSingleFile()
     {
-        return new WindowsRecycleBin(1);
+        return new WindowsRecycleBin(1, "", default(FileIdentity), false);
+    }
+
+    internal static WindowsRecycleBin CreateForSingleFile(string expectedLongPath, FileIdentity expectedId)
+    {
+        return new WindowsRecycleBin(1, expectedLongPath ?? "", expectedId, expectedId.Ok);
     }
 
     public bool IsAvailable(string path, long bytes, bool sizeComplete, out string reason, out DeleteRefusalKind kind)
@@ -248,40 +325,67 @@ public sealed class WindowsRecycleBin : IRecycleBin
 
     public RecycleEvidence SendFile(string path)
     {
-        RealDispatchAttempts++;
+        Interlocked.Increment(ref RealDispatchAttempts);
         RecycleEvidence ev = new RecycleEvidence();
         ShellRecycle.IFileOperation op = null;
+        ShellRecycle.IShellItem item = null;
         uint cookie = 0;
         bool advised = false;
+        bool comCreated = false;
         try
         {
-            bool authorizedSingle = System.Threading.Interlocked.Exchange(ref singleFileQuota, 0) == 1;
+            bool authorizedSingle = Interlocked.Exchange(ref singleFileQuota, 0) == 1;
             if (!authorizedSingle)
             {
                 DeleteEngine.RequireGate();     // 与旧后端同一道闸门（编译期常量派生）
-                RealGateBypasses++;
+                Interlocked.Increment(ref RealGateBypasses);
             }
 
-            if (String.IsNullOrEmpty(path) || !System.IO.Path.IsPathRooted(path) || System.IO.Directory.Exists(path))
+            string canon = PathGuard.Canonical(path);
+            if (canon.Length == 0
+                || !PathGuard.IsLocalDrivePath(canon)
+                || Directory.Exists(canon)
+                || PathGuard.IsReparsePoint(canon)
+                || PathGuard.HasAnyReparseComponent(canon))
             {
-                ev.HrPerform = unchecked((int)0x80070057);   // E_INVALIDARG：仅接受完整普通文件路径
+                ev.HrPerform = unchecked((int)0x80070057);   // E_INVALIDARG：仅接受本地非重解析普通文件路径
                 return ev;
             }
 
             // STA 约束（产品调用层的**保守**约定）：
-            // 事实基础：本机实验工具（MTA）也能跑通 IFileOperation，
-            // 所以“MTA 一定失败”并不成立。但 shell 对象的文档定位是 STA，
-            // 产品实际入口（WinForms 按钮 → UI 线程，Main 上标了 [STAThread]）也是 STA。
-            // 因此这里**主动**拒绝非 STA 线程：宁可拒给一个可能能跑的组合，
-            // 也不要依赖“容忍但无文档保证”的行为。
-            if (System.Threading.Thread.CurrentThread.GetApartmentState() != System.Threading.ApartmentState.STA)
+            // 仅在 STA 线程调用 Shell IFileOperation，拒绝非 STA 线程。
+            if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
             {
                 ev.HrPerform = unchecked((int)0x80010106);   // RPC_E_CHANGED_MODE
                 return ev;
             }
 
-            RecycleSink sink = new RecycleSink();
+            FileIdentity liveId;
+            string liveLong;
+            string handleWhy;
+            if (!PermanentDeleteBin.VerifySingleFileHandle(canon, out liveId, out liveLong, out handleWhy))
+            {
+                ev.HrPerform = unchecked((int)0x80070057);
+                return ev;
+            }
+            if (expectedLongPath.Length > 0
+                && !String.Equals(liveLong, expectedLongPath, StringComparison.OrdinalIgnoreCase))
+            {
+                ev.HrPerform = ShellRecycle.HR_ERROR_CANCELLED;
+                return ev;
+            }
+            if (hasExpectedIdentity && (!expectedId.Ok || !liveId.SameAs(expectedId)))
+            {
+                ev.HrPerform = ShellRecycle.HR_ERROR_CANCELLED;
+                return ev;
+            }
+
+            string sinkExpectedLong = expectedLongPath.Length > 0 ? expectedLongPath : liveLong;
+            FileIdentity sinkExpectedId = hasExpectedIdentity ? expectedId : liveId;
+
+            RecycleSink sink = new RecycleSink(sinkExpectedLong, sinkExpectedId, true);
             op = (ShellRecycle.IFileOperation)new ShellRecycle.FileOperation();
+            comCreated = true;
 
             ev.HrPerform = op.SetOperationFlags(ShellRecycle.Flags);
             if (ev.HrPerform < 0) return ev;
@@ -290,7 +394,7 @@ public sealed class WindowsRecycleBin : IRecycleBin
             if (ev.HrPerform < 0) return ev;
             advised = true;
 
-            ShellRecycle.IShellItem item = ShellRecycle.Item(path);
+            item = ShellRecycle.Item(canon);
             ev.HrPerform = op.DeleteItem(item, null);
             if (ev.HrPerform < 0) return ev;
 
@@ -300,22 +404,30 @@ public sealed class WindowsRecycleBin : IRecycleBin
             try { op.GetAnyOperationsAborted(out aborted); ev.Aborted = aborted; } catch { }
             ev.HrDelete = sink.HrDelete;
             ev.PostDeleteItemFired = sink.PostDeleteItemCount > 0;
-            ev.NewlyCreatedPresent = sink.NewlyCreatedPresent;
             ev.RecycledTo = sink.RecycledTo;
+            ev.NewlyCreatedPresent = (sink.PostDeleteItemCount == 1)
+                && (sink.HrDelete >= 0)
+                && sink.NewlyCreatedPresent
+                && !String.IsNullOrEmpty(sink.RecycledTo)
+                && sink.RecycledTo.IndexOf("\\$Recycle.Bin\\", StringComparison.OrdinalIgnoreCase) >= 0;
             return ev;
         }
         finally
         {
-            // COM 生命周期：先注销回调，再释放，然后强制收尾。
-            // （本机实验已验证这条释放路径不崩溃、引用计数归零。）
+            if (item != null)
+            {
+                try { Marshal.ReleaseComObject(item); } catch { }
+            }
             if (op != null)
             {
                 if (advised) { try { op.Unadvise(cookie); } catch { } }
                 try { Marshal.ReleaseComObject(op); } catch { }
             }
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
+            if (comCreated)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
         }
     }
 
@@ -327,7 +439,7 @@ public sealed class WindowsRecycleBin : IRecycleBin
     ///   * 不得把“原路径消失”当回收证据；
     ///   * 只有 psiNewlyCreated != NULL **且**源已消失才叫 RecycledVerified；
     ///   * psiNewlyCreated == NULL 且源已消失 ⇒ **结果未知**（可能是永久删除，
-    ///     也可能是别的情形；不可回收分支尚未实测，所以一律 fail-closed）；
+    ///     也可能是别的情形；一律 fail-closed）；
     ///   * 源仍在 ⇒ 没有成功回收：身份一致 ⇒ FailedStillPresent（**取消就是这一支**，
     ///     绝不会被误报成永久删除）；身份不一致或读不到 ⇒ 结果未知；
     ///   * psiNewlyCreated != NULL 但源仍在 ⇒ 同样不算回收。
@@ -369,7 +481,7 @@ public sealed class WindowsRecycleBin : IRecycleBin
                  + "（psiNewlyCreated != NULL）"
                  + (ev.Aborted ? "；注意 GetAnyOperationsAborted=true" : "");
         return "原路径已消失，但 **psiNewlyCreated == NULL：没有回收证据**。"
-             + "无法区分它是被永久删除还是别的情形（不可回收分支尚未实测），"
+             + "无法区分它是被永久删除还是别的情形，"
              + "请立即人工核实回收站与原位置。";
     }
 }

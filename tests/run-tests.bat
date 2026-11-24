@@ -1,15 +1,15 @@
 @echo off
 rem Modular v1.0.0 safety & architecture regression tests.
 rem   1) LegacyRepro            - audited S1/S2 false-positive & content-verification repros (17 checks)
-rem   2) SelfTest               - 5-group high-SNR suite (Groups A-E, 259 checks)
+rem   2) SelfTest               - 6-group high-SNR suite (Groups A-F, incl. security regressions)
 rem   3) AnPingExplanationTest  - human-guide explanation & prose contract test
 rem Runs strictly in %TEMP% sandbox; zero real user files or Windows settings touched.
 setlocal
 cd /d "%~dp0"
 chcp 65001 >nul
 
-set CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-if not exist "%CSC%" set CSC=C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe
+set CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+if not exist "%CSC%" set CSC=%SystemRoot%\Microsoft.NET\Framework\v4.0.30319\csc.exe
 set FAIL=0
 
 echo ============================================================
@@ -27,7 +27,7 @@ del /q LegacyRepro.exe >nul 2>&1
 
 echo.
 echo ============================================================
-echo [2/3] modular v1.0.0 core self test (Groups A-E)
+echo [2/3] modular v1.0.0 core self test (Groups A-F)
 echo ============================================================
 "%CSC%" -nologo -langversion:5 -warnaserror -codepage:65001 -target:exe -main:SelfTest -out:SelfTest.exe ^
   -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:System.Web.Extensions.dll ^
