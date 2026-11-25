@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text.RegularExpressions;
 
 /// <summary>
@@ -73,37 +74,68 @@ public static class EvidenceRules
         public string Excludes = "";
     }
 
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromMilliseconds(200);
+
     private static readonly Regex FlatUserDataRegex =
-        new Regex(@"[\\/]user data[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/]user data[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex BrowserSubdirRegex =
-        new Regex(@"[\\/](cache[\\/]cache_data|code cache|gpucache|dawncache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"[\\/](cache[\\/]cache_data|code cache|gpucache|dawncache)[\\/]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatBrowserFileNameRegex =
         new Regex(@"^([0-9a-f]{16}_([0-9a-f]+|s)|data_[0-9]+|f_[0-9a-f]{6,8}|index|the-real-index)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatFirefoxFileNameRegex =
         new Regex(@"^([0-9a-f]{40}|.+\.(little|bin))$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatThumbFileNameRegex =
         new Regex(@"^(thumbcache|iconcache)_[^\\/]*\.db$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatShaderFileNameRegex =
-        new Regex(@"^(?!.*\.lock$).+\.(val|idx|bin|toc|parc|dxbc|nvph)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^(?!.*\.(?:lock|lck|lockfile)$).+\.(val|idx|bin|toc|parc|dxbc|nvph)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatWerFileNameRegex =
         new Regex(@"\.(wer|cab|dmp|mdmp|hdmp)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatAppVsixFileNameRegex =
         new Regex(@"\.vsix$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatChatCacheFileNameRegex =
-        new Regex(@"^(?!.*\.(lock|db|sqlite|exe|dll|sys|ini|cfg|config|pdf|docx|doc|xlsx|xls|pptx|ppt|zip|rar|7z|psd|rtf)$)([0-9a-f]{16}_([0-9a-f]+|s)|data_[0-9]+|f_[0-9a-f]{6,8}|index|the-real-index|.+\.(wxapkg|jpg|jpeg|png|gif|webp|mp4|tmp|bin|pak|cache)|[0-9a-fA-F_-]{6,64})$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^(?!.*\.(?:lock|lck|lockfile|db|db-wal|db-shm|db-journal|sqlite|sqlite-wal|sqlite-shm|exe|dll|sys|ini|cfg|config|key|pem|pfx|p12|cer|crt|env|kdbx|pdf|docx|doc|xlsx|xls|pptx|ppt|zip|rar|7z|psd|rtf)$)([0-9a-f]{16}_([0-9a-f]+|s)|data_[0-9]+|f_[0-9a-f]{6,8}|index|the-real-index|.+\.(wxapkg|jpg|jpeg|png|gif|webp|mp4|tmp|bin|pak|cache)|[0-9a-fA-F_-]{6,64})$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex FlatWinUpdateFileNameRegex =
-        new Regex(@"^(?!.*\.(lock|pdf|docx|doc|xlsx|xls|pptx|ppt|psd|rtf|sqlite|db|edb)$).+\.(cab|esd|wim|psf|msu|cbs|exe|dll|xml|json|bin|dat)$",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        new Regex(@"^(?!.*\.(?:lock|lck|lockfile|pdf|docx|doc|xlsx|xls|pptx|ppt|psd|rtf|pfx|p12|cer|crt|key|pem|kdbx|jpg|jpeg|png|gif|bmp|webp|heic|mp4|mov|avi|mkv|sqlite|sqlite3|sqlite-wal|sqlite-shm|db|db-wal|db-shm|db-journal|edb)$).+\.(cab|esd|wim|psf|msu|cbs|exe|dll|xml|json|bin|dat)$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex WinUpdateDataStoreRegex =
         new Regex(@"[\\/]datastore([\\/]|$)",
-            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
+
+    private static readonly string DynamicWinDir = InitWinDir();
+    private static readonly string DynamicWinInstallerDir = DynamicWinDir.Length > 0 ? Path.Combine(DynamicWinDir, "Installer") : "";
+    private static readonly string[] DynamicWinSystemDirs = InitDynamicWinSystemDirs(DynamicWinDir);
+
+    private static string InitWinDir()
+    {
+        try { return PathGuard.Canonical(Environment.GetFolderPath(Environment.SpecialFolder.Windows)); }
+        catch { return ""; }
+    }
+
+    private static string[] InitDynamicWinSystemDirs(string winDir)
+    {
+        if (string.IsNullOrEmpty(winDir)) return new string[0];
+        return new string[]
+        {
+            Path.Combine(winDir, "System32"),
+            Path.Combine(winDir, "SysWOW64"),
+            Path.Combine(winDir, "SysArm32"),
+            Path.Combine(winDir, "SysNative"),
+            Path.Combine(winDir, "WinSxS"),
+            Path.Combine(winDir, "System"),
+            Path.Combine(winDir, "Boot"),
+            Path.Combine(winDir, "servicing"),
+            Path.Combine(winDir, "SystemApps"),
+            Path.Combine(winDir, "SystemResources"),
+            Path.Combine(Path.Combine(winDir, "SoftwareDistribution"), "DataStore")
+        };
+    }
 
     private static readonly Rule[] All = BuildRules();
 
@@ -115,53 +147,53 @@ public static class EvidenceRules
         list.Add(new Rule
         {
             Id = "KEEP-SYSTEM",
-            Pattern = @"system32|syswow64|winsxs|(^|[\\/])windows[\\/]system",
+            Pattern = @"system32|syswow64|sysarm32|sysnative|winsxs|(^|[\\/])windows[\\/](system|boot|servicing|systemapps|systemresources)([\\/]|$)|(^|[\\/])softwaredistribution[\\/]datastore([\\/]|$)|^[a-z]:[\\/](boot|recovery|system volume information)([\\/]|$)|^[a-z]:[\\/](hiberfil\.sys|pagefile\.sys|swapfile\.sys|bootmgr|bootnxt)$",
             NameOnly = false,
             Risk = RiskKeep,
             App = "Windows 操作系统",
             Reason = "系统核心组件目录",
             Consequence = "严禁删除。删除可能导致系统服务损坏、无法开机。",
-            Scope = "完整路径命中系统目录",
+            Scope = "完整路径命中系统核心目录或系统根文件",
             Excludes = "无（无条件保留）"
         });
 
-        // 微软 KB2667628：Installer 缓存用于修复/更新/卸载，不应手动删除。只匹配目录直接子文件。
+        // 微软 KB2667628：Installer 缓存用于修复/更新/卸载，不应手动删除。
         list.Add(new Rule
         {
             Id = "KEEP-MSICACHE",
-            Pattern = @"^[a-z]:[\\/]windows[\\/]installer[\\/][^\\/]+\.(msi|msp)$",
+            Pattern = @"(^|[\\/])windows[\\/]installer[\\/](?:.+\.(msi|msp|mst)|\$patchcache\$(?:[\\/].*)?)$",
             NameOnly = false,
             Risk = RiskKeep,
             App = "Windows Installer",
             Reason = "Windows Installer 维护缓存（微软 KB2667628）",
             Consequence = "不建议手动删除。缺失后对应软件可能无法修复、更新或卸载。",
-            Scope = "%WINDIR%\\Installer 直接子文件，扩展名 .msi / .msp",
+            Scope = "%WINDIR%\\Installer 下的 .msi / .msp / .mst 及 $PatchCache$",
             Excludes = "无（无条件保留）"
         });
 
         list.Add(new Rule
         {
             Id = "KEEP-LOCK",
-            Pattern = @"\.(lock)$",
+            Pattern = @"\.(lock|lck|lockfile)$|^singletonlock$|^lock$",
             NameOnly = true,
             Risk = RiskKeep,
             App = "系统或软件互斥锁",
             Reason = "进程运行锁文件",
             Consequence = "严禁删除。它代表某个程序正在运行，删除会引发冲突。",
-            Scope = "文件名为 *.lock",
+            Scope = "文件名为 *.lock / *.lck / *.lockfile / SingletonLock / LOCK",
             Excludes = "无（无条件保留）"
         });
 
         list.Add(new Rule
         {
             Id = "KEEP-CHATDB",
-            Pattern = @"(wechat files|xwechat_files|wxwork|tencent files)[\\/].*[\\/](msg|nt_msg|nt_db)[\\/].+\.(db|db-wal|db-shm|idx)$",
+            Pattern = "",
             NameOnly = false,
             Risk = RiskKeep,
             App = "微信 / QQ 聊天数据库",
             Reason = "聊天记录核心数据库",
             Consequence = "严禁删除。删除会导致本地聊天记录永久丢失。",
-            Scope = "微信、企业微信或 QQ 账号 Msg / nt_msg 目录下的聊天记录核心数据库",
+            Scope = "微信、企业微信或 QQ 账号 Msg / db_storage / nt_msg / nt_db / nt_data 聊天记录核心数据库",
             Excludes = "无（无条件保留）"
         });
 
@@ -289,7 +321,7 @@ public static class EvidenceRules
             Rule item = list[i];
             if (!string.IsNullOrEmpty(item.Pattern))
             {
-                try { item.Compiled = new Regex(item.Pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant); }
+                try { item.Compiled = new Regex(item.Pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout); }
                 catch { item.Compiled = null; }
             }
         }
@@ -337,36 +369,84 @@ public static class EvidenceRules
         if (name == null) name = "";
         if (fullPath == null) fullPath = "";
 
+        // 规范化（含 8.3 短名展开与 \\?\ 剥离），避免设备前缀或 8.3 别名绕过 KEEP-* 保护
+        string evalPath = NormalizePathForRuleMatch(fullPath);
+
         foreach (Rule r in All)
         {
-            if (r.Id == "TMP-BROWSERCACHE" && CacheRoots.IsBrowserProtectedPath(name, fullPath))
+            if (r.Id == "TMP-BROWSERCACHE" && CacheRoots.IsBrowserProtectedPath(name, evalPath))
                 continue;
-            if (r.Id == "TMP-CHATCACHE" && (ChatStorageLocator.IsChatProtectedUserContent(fullPath) || CacheRoots.IsBrowserProtectedPath(name, fullPath)))
+            if (r.Id == "TMP-CHATCACHE" && (ChatStorageLocator.IsChatProtectedUserContent(evalPath) || CacheRoots.IsBrowserProtectedPath(name, evalPath)))
                 continue;
-            if (r.Id == "TMP-APPCACHE" && CacheRoots.IsAppProtectedPath(name, fullPath))
+            if (r.Id == "TMP-APPCACHE" && CacheRoots.IsAppProtectedPath(name, evalPath))
                 continue;
-            if (r.Id == "TMP-WINUPDATE" && WinUpdateDataStoreRegex.IsMatch(fullPath))
+            if (r.Id == "TMP-WINUPDATE" && SafeIsMatch(WinUpdateDataStoreRegex, evalPath, true))
                 continue;
 
-            string target = r.NameOnly ? name : fullPath;
-            bool hit;
-            try
+            bool hit = false;
+            if (r.Id == "KEEP-CHATDB")
             {
-                hit = r.Compiled != null
-                    ? r.Compiled.IsMatch(target)
-                    : Regex.IsMatch(target, r.Pattern, RegexOptions.IgnoreCase);
+                hit = ChatStorageLocator.IsChatDatabasePath(evalPath)
+                    || (!string.Equals(evalPath, fullPath, StringComparison.OrdinalIgnoreCase) && ChatStorageLocator.IsChatDatabasePath(fullPath));
             }
-            catch { hit = false; }
-
-            if (!hit && r.Id == "KEEP-CHATDB")
+            else
             {
-                hit = ChatStorageLocator.IsChatDatabasePath(fullPath);
+                string target = r.NameOnly ? name : evalPath;
+                if (!string.IsNullOrEmpty(r.Pattern))
+                {
+                    try
+                    {
+                        hit = r.Compiled != null
+                            ? r.Compiled.IsMatch(target)
+                            : Regex.IsMatch(target, r.Pattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, RegexTimeout);
+                    }
+                    catch
+                    {
+                        // Fail-Closed：保护性规则或用户数据规则异常/超时时绝不穿透到 RiskSafe！
+                        if (r.Risk == RiskKeep)
+                        {
+                            ev.RuleId = r.Id;
+                            ev.Risk = RiskKeep;
+                            ev.App = r.App;
+                            ev.Reason = r.Reason + "（规则匹配异常，保守保留）";
+                            ev.Consequence = r.Consequence;
+                            ev.Scope = r.Scope;
+                            ev.Excludes = r.Excludes;
+                            ev.PolicyEligible = false;
+                            ev.DenyReason = "规则层不授予删除授权";
+                            return ev;
+                        }
+                        if (r.Id.StartsWith("USER-", StringComparison.Ordinal))
+                        {
+                            ev.RuleId = r.Id;
+                            ev.Risk = RiskReview;
+                            ev.App = r.App;
+                            ev.Reason = r.Reason + "（规则匹配异常，保守复核）";
+                            ev.Consequence = r.Consequence;
+                            ev.Scope = r.Scope;
+                            ev.Excludes = r.Excludes;
+                            ev.PolicyEligible = false;
+                            ev.DenyReason = "规则层不授予删除授权";
+                            return ev;
+                        }
+                        hit = false;
+                    }
+                }
+
+                if (!hit && r.Id == "KEEP-SYSTEM")
+                {
+                    hit = IsDynamicKeepSystemPath(evalPath);
+                }
+                else if (!hit && r.Id == "KEEP-MSICACHE")
+                {
+                    hit = IsDynamicKeepMsiCachePath(evalPath);
+                }
             }
 
             // 支持沙盒测试对扁平目录调用 InjectForTest 放入标准缓存文件名（不影响任何缓存根外的同名文件归类）
             if (!hit)
             {
-                hit = MatchesFlatInjectedRoot(r, name, fullPath);
+                hit = MatchesFlatInjectedRoot(r, name, evalPath);
             }
 
             if (!hit) continue;
@@ -375,7 +455,7 @@ public static class EvidenceRules
             if (r.Id == "TMP-BROWSERCACHE" || r.Id == "TMP-CHATCACHE" || r.Id == "TMP-APPCACHE")
             {
                 string ownerRule, ownerWhy;
-                if (CacheRoots.Match(fullPath, out ownerRule, out ownerWhy)
+                if (CacheRoots.Match(evalPath, out ownerRule, out ownerWhy)
                     && (ownerRule == "TMP-BROWSERCACHE" || ownerRule == "TMP-CHATCACHE" || ownerRule == "TMP-APPCACHE")
                     && ownerRule != r.Id)
                 {
@@ -401,7 +481,7 @@ public static class EvidenceRules
             if (r.Risk == RiskSafe)
             {
                 string hitRule, hitWhy;
-                bool inRoot = CacheRoots.Match(fullPath, out hitRule, out hitWhy);
+                bool inRoot = CacheRoots.Match(evalPath, out hitRule, out hitWhy);
                 int minDays = r.MinAgeHours > 0 ? Math.Max(1, r.MinAgeHours / 24) : 0;
 
                 if (!inRoot)
@@ -442,44 +522,91 @@ public static class EvidenceRules
         return ev;
     }
 
+    private static string NormalizePathForRuleMatch(string fullPath)
+    {
+        if (string.IsNullOrEmpty(fullPath)) return "";
+        string canon = PathGuard.CanonicalFast(fullPath);
+        if (canon.Length > 0) return canon;
+        string s = fullPath.Trim();
+        if (s.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase))
+            return s;
+        if (s.StartsWith("\\\\?\\", StringComparison.Ordinal) || s.StartsWith("\\\\.\\", StringComparison.Ordinal))
+        {
+            string stripped = s.Substring(4);
+            string strippedCanon = PathGuard.Canonical(stripped);
+            return strippedCanon.Length > 0 ? strippedCanon : stripped;
+        }
+        return s;
+    }
+
+    private static bool SafeIsMatch(Regex re, string input, bool failClosedValue)
+    {
+        if (re == null || input == null) return failClosedValue;
+        try { return re.IsMatch(input); }
+        catch { return failClosedValue; }
+    }
+
+    private static bool IsDynamicKeepSystemPath(string evalPath)
+    {
+        if (string.IsNullOrEmpty(evalPath) || DynamicWinSystemDirs.Length == 0) return false;
+        for (int i = 0; i < DynamicWinSystemDirs.Length; i++)
+        {
+            if (PathGuard.IsInside(DynamicWinSystemDirs[i], evalPath))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool IsDynamicKeepMsiCachePath(string evalPath)
+    {
+        if (string.IsNullOrEmpty(evalPath) || DynamicWinInstallerDir.Length == 0) return false;
+        if (!PathGuard.IsInside(DynamicWinInstallerDir, evalPath)) return false;
+        if (evalPath.IndexOf("\\$PatchCache$", StringComparison.OrdinalIgnoreCase) >= 0
+            || evalPath.IndexOf("/$PatchCache$", StringComparison.OrdinalIgnoreCase) >= 0)
+            return true;
+        return evalPath.EndsWith(".msi", StringComparison.OrdinalIgnoreCase)
+            || evalPath.EndsWith(".msp", StringComparison.OrdinalIgnoreCase)
+            || evalPath.EndsWith(".mst", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool MatchesFlatInjectedRoot(Rule r, string name, string fullPath)
     {
         if (!CacheRoots.HasInjectedForTest) return false;
 
         if (r.Id == "TMP-BROWSERCACHE"
-            && ((!FlatUserDataRegex.IsMatch(fullPath)
-                 && (FlatBrowserFileNameRegex.IsMatch(name) || FlatFirefoxFileNameRegex.IsMatch(name)))
-                || BrowserSubdirRegex.IsMatch(fullPath)))
+            && ((!SafeIsMatch(FlatUserDataRegex, fullPath, true)
+                 && (SafeIsMatch(FlatBrowserFileNameRegex, name, false) || SafeIsMatch(FlatFirefoxFileNameRegex, name, false)))
+                || SafeIsMatch(BrowserSubdirRegex, fullPath, false)))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-BROWSERCACHE";
         }
 
         if (r.Id == "TMP-APPCACHE"
-            && (FlatBrowserFileNameRegex.IsMatch(name)
-                || FlatAppVsixFileNameRegex.IsMatch(name)
-                || BrowserSubdirRegex.IsMatch(fullPath)))
+            && (SafeIsMatch(FlatBrowserFileNameRegex, name, false)
+                || SafeIsMatch(FlatAppVsixFileNameRegex, name, false)
+                || SafeIsMatch(BrowserSubdirRegex, fullPath, false)))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-APPCACHE";
         }
 
         if (r.Id == "TMP-THUMBCACHE"
-            && FlatThumbFileNameRegex.IsMatch(name))
+            && SafeIsMatch(FlatThumbFileNameRegex, name, false))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-THUMBCACHE";
         }
 
         if (r.Id == "TMP-SHADERCACHE"
-            && FlatShaderFileNameRegex.IsMatch(name))
+            && SafeIsMatch(FlatShaderFileNameRegex, name, false))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-SHADERCACHE";
         }
 
         if (r.Id == "TMP-WER"
-            && FlatWerFileNameRegex.IsMatch(name))
+            && SafeIsMatch(FlatWerFileNameRegex, name, false))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-WER";
@@ -488,15 +615,15 @@ public static class EvidenceRules
         if (r.Id == "TMP-CHATCACHE"
             && !ChatStorageLocator.IsChatProtectedUserContent(fullPath)
             && !CacheRoots.IsBrowserProtectedPath(name, fullPath)
-            && (FlatChatCacheFileNameRegex.IsMatch(name) || BrowserSubdirRegex.IsMatch(fullPath)))
+            && (SafeIsMatch(FlatChatCacheFileNameRegex, name, false) || SafeIsMatch(BrowserSubdirRegex, fullPath, false)))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-CHATCACHE";
         }
 
         if (r.Id == "TMP-WINUPDATE"
-            && !WinUpdateDataStoreRegex.IsMatch(fullPath)
-            && FlatWinUpdateFileNameRegex.IsMatch(name))
+            && !SafeIsMatch(WinUpdateDataStoreRegex, fullPath, true)
+            && SafeIsMatch(FlatWinUpdateFileNameRegex, name, false))
         {
             string mappedRule, mappedWhy;
             return CacheRoots.Match(fullPath, out mappedRule, out mappedWhy) && mappedRule == "TMP-WINUPDATE";

@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 
 function detectNotes(samples, rate) {
-  const bins = [], width = Math.round(rate * 0.01);
+  const bins = [], width = Math.max(1, Math.round(rate * 0.01));
   for (let i = 0; i < samples.length; i += width) {
     const q = samples.slice(i, i + width);
     bins.push(Math.sqrt(q.reduce((s, x) => s + x * x, 0) / q.length));
@@ -59,12 +59,19 @@ if (!dir) {
 
 for (const name of ['01-enabled-real-end', '02-reopened-real-end', '03-blur-at-real-end', '04-minimized-real-end', '05-restarted-real-end']) {
   const b = fs.readFileSync(path.join(dir, name + '.wav'));
-  const rate = b.readUInt32LE(24), ch = b.readUInt16LE(22), bits = b.readUInt16LE(34), floating = b.readUInt16LE(20) === 3, step = bits / 8 * ch, samples = [];
+  assert(b.length >= 44, 'Invalid WAV header (too short): ' + name);
+  const fmtTag = b.readUInt16LE(20), ch = b.readUInt16LE(22), rate = b.readUInt32LE(24), bits = b.readUInt16LE(34), floating = fmtTag === 3;
+  assert(rate >= 8000 && rate <= 384000, 'Invalid WAV sample rate: ' + rate);
+  assert(ch >= 1 && ch <= 8, 'Invalid WAV channels: ' + ch);
+  assert((!floating && fmtTag === 1 && bits === 16) || (floating && bits === 32), 'Unsupported WAV format/bits: ' + fmtTag + '/' + bits);
+  const step = (bits / 8) * ch, samples = [];
+  assert(step > 0, 'Invalid WAV frame step');
   for (let i = 44; i + step <= b.length; i += step) {
     let x = 0;
     for (let c = 0; c < ch; c++) x += floating ? b.readFloatLE(i + c * bits / 8) : b.readInt16LE(i + c * bits / 8) / 32768;
     samples.push(x / ch);
   }
+  assert(samples.length > 0, 'Empty WAV data: ' + name);
   const notes = detectNotes(samples, rate);
   const report = { name, seconds: samples.length / rate, notes };
   fs.writeFileSync(path.join(dir, name + '-waveform.json'), JSON.stringify(report, null, 2));

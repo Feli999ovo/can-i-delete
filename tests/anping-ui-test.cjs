@@ -6,133 +6,143 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..');
-const script = fs.readFileSync(process.argv[2] || path.join(root, 'ui', 'app.js'), 'utf8');
-new vm.Script(script);
 
-class Element {
-  constructor(id = '') {
-    this.id = id;
-    this.style = { setProperty() {}, width: '', height: '', transform: '', margin: '', opacity: '', left: '', top: '' };
-    this.dataset = {};
-    this.innerHTML = '';
-    this.textContent = '';
-    this.hidden = false;
-    this.inert = false;
-    this.disabled = false;
-    this.checked = false;
-    this.value = '';
-    this.scrollTop = 0;
-    this.scrollHeight = 120;
-    this.offsetWidth = 960;
-    this.offsetHeight = 640;
-    this.clientWidth = 960;
-    this.clientHeight = 360;
-    this.attrs = {};
-    this._classes = new Set();
-    this.classList = {
-      add: (...cs) => cs.forEach(c => this._classes.add(c)),
-      remove: (...cs) => cs.forEach(c => this._classes.delete(c)),
-      toggle: (c, force) => {
-        const on = force === undefined ? !this._classes.has(c) : !!force;
-        if (on) this._classes.add(c); else this._classes.delete(c);
-        return on;
-      },
-      contains: c => this._classes.has(c)
-    };
+function createHarness(scriptPath) {
+  const script = fs.readFileSync(scriptPath || path.join(root, 'ui', 'app.js'), 'utf8');
+  new vm.Script(script);
+
+  class Element {
+    constructor(id = '') {
+      this.id = id;
+      this.style = { setProperty() {}, width: '', height: '', transform: '', margin: '', opacity: '', left: '', top: '' };
+      this.dataset = {};
+      this.innerHTML = '';
+      this.textContent = '';
+      this.hidden = false;
+      this.inert = false;
+      this.disabled = false;
+      this.checked = false;
+      this.value = '';
+      this.scrollTop = 0;
+      this.scrollHeight = 120;
+      this.offsetWidth = 960;
+      this.offsetHeight = 640;
+      this.clientWidth = 960;
+      this.clientHeight = 360;
+      this.attrs = {};
+      this._classes = new Set();
+      this.classList = {
+        add: (...cs) => cs.forEach(c => this._classes.add(c)),
+        remove: (...cs) => cs.forEach(c => this._classes.delete(c)),
+        toggle: (c, force) => {
+          const on = force === undefined ? !this._classes.has(c) : !!force;
+          if (on) this._classes.add(c); else this._classes.delete(c);
+          return on;
+        },
+        contains: c => this._classes.has(c)
+      };
+    }
+    get className() { return Array.from(this._classes).join(' '); }
+    set className(v) { this._classes = new Set(String(v || '').split(/\s+/).filter(Boolean)); }
+    querySelector(selector) {
+      if (selector === '.seg-ctl') return null;
+      this.queries = this.queries || {};
+      return this.queries[selector] || (this.queries[selector] = new Element(selector));
+    }
+    querySelectorAll(selector) {
+      if (selector === '.seg') return [new Element(), new Element(), new Element()];
+      if (selector === '.ds .d') return [new Element(), new Element(), new Element()];
+      return [];
+    }
+    appendChild() {}
+    replaceChild() {}
+    replaceChildren() {}
+    replaceWith() {}
+    prepend() {}
+    before() {}
+    contains() { return false; }
+    closest() { return null; }
+    matches() { return false; }
+    addEventListener(type, fn) { this.listeners = this.listeners || {}; this.listeners[type] = fn; }
+    focus() {}
+    click() { if (typeof this.onclick === 'function') this.onclick({ stopPropagation() {}, preventDefault() {}, currentTarget: this }); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return this.attrs[k] || null; }
+    removeAttribute(k) { delete this.attrs[k]; }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 100, height: 100 }; }
+    getClientRects() { return [{ width: 10, height: 10 }]; }
   }
-  get className() { return Array.from(this._classes).join(' '); }
-  set className(v) { this._classes = new Set(String(v || '').split(/\s+/).filter(Boolean)); }
-  querySelector(selector) {
-    if (selector === '.seg-ctl') return null;
-    this.queries = this.queries || {};
-    return this.queries[selector] || (this.queries[selector] = new Element(selector));
+
+  const nodes = {}, sent = [], listeners = {}, timeouts = [];
+  const get = id => nodes[id] || (nodes[id] = new Element(id));
+  const webview = {
+    postMessage: json => sent.push(JSON.parse(json)),
+    addEventListener: (name, callback) => { listeners[name] = callback; }
+  };
+  const docListeners = {};
+  const documentStub = {
+    body: new Element('body'),
+    documentElement: new Element('html'),
+    activeElement: get('soundBtn'),
+    readyState: 'complete',
+    getElementById: get,
+    createElement: () => new Element(),
+    createTextNode: text => ({ textContent: text }),
+    querySelector: sel => get('qs:' + sel),
+    querySelectorAll: () => [],
+    addEventListener: (name, callback) => { docListeners[name] = callback; }
+  };
+  const windowStub = {
+    innerWidth: 960,
+    innerHeight: 640,
+    chrome: { webview },
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
+    addEventListener: (name, callback) => { listeners['window:' + name] = callback; }
+  };
+  const localStorageStub = {
+    _map: new Map(),
+    getItem(k) { return this._map.has(k) ? this._map.get(k) : null; },
+    setItem(k, v) { this._map.set(k, String(v)); }
+  };
+
+  const context = vm.createContext({
+    console: { log() {}, error() {} },
+    document: documentStub,
+    window: windowStub,
+    navigator: {},
+    localStorage: localStorageStub,
+    performance: { now: () => 0 },
+    requestAnimationFrame: () => 1,
+    setTimeout: callback => { timeouts.push(callback); return timeouts.length; },
+    clearTimeout: () => {}
+  });
+  windowStub.window = windowStub;
+
+  vm.runInContext(fs.readFileSync(path.join(root, 'ui', 'anping-audio.js'), 'utf8'), context);
+  context.AnPingAudio = windowStub.AnPingAudio;
+  vm.runInContext(script, context);
+
+  const origToast = context.toast;
+  context.toast = text => { context.lastToast = text; origToast(text); };
+
+  function receive(data) { listeners.message({ data }); }
+  function category(files = []) {
+    return { id: 'tmp', name: '真实分类', total: 1, ok: 0, review: 1, keep: 0, count: files.length, files };
   }
-  querySelectorAll(selector) {
-    if (selector === '.seg') return [new Element(), new Element(), new Element()];
-    if (selector === '.ds .d') return [new Element(), new Element(), new Element()];
-    return [];
-  }
-  appendChild() {}
-  replaceChild() {}
-  replaceChildren() {}
-  replaceWith() {}
-  prepend() {}
-  before() {}
-  contains() { return false; }
-  closest() { return null; }
-  matches() { return false; }
-  addEventListener(type, fn) { this.listeners = this.listeners || {}; this.listeners[type] = fn; }
-  focus() {}
-  click() { if (typeof this.onclick === 'function') this.onclick({ stopPropagation() {}, preventDefault() {}, currentTarget: this }); }
-  setAttribute(k, v) { this.attrs[k] = String(v); }
-  getAttribute(k) { return this.attrs[k] || null; }
-  removeAttribute(k) { delete this.attrs[k]; }
-  getBoundingClientRect() { return { left: 0, top: 0, width: 100, height: 100 }; }
-  getClientRects() { return [{ width: 10, height: 10 }]; }
+
+  return { context, windowStub, documentStub, localStorageStub, get, sent, listeners, docListeners, timeouts, receive, category };
 }
 
-const nodes = {}, sent = [], listeners = {}, timeouts = [];
-const get = id => nodes[id] || (nodes[id] = new Element(id));
-const webview = {
-  postMessage: json => sent.push(JSON.parse(json)),
-  addEventListener: (name, callback) => { listeners[name] = callback; }
-};
-const docListeners = {};
-const documentStub = {
-  body: new Element('body'),
-  documentElement: new Element('html'),
-  activeElement: get('soundBtn'),
-  readyState: 'complete',
-  getElementById: get,
-  createElement: () => new Element(),
-  createTextNode: text => ({ textContent: text }),
-  querySelector: sel => get('qs:' + sel),
-  querySelectorAll: () => [],
-  addEventListener: (name, callback) => { docListeners[name] = callback; }
-};
-const windowStub = {
-  innerWidth: 960,
-  innerHeight: 640,
-  chrome: { webview },
-  matchMedia: () => ({ matches: false, addEventListener() {} }),
-  addEventListener: (name, callback) => { listeners['window:' + name] = callback; }
-};
-const localStorageStub = {
-  _map: new Map(),
-  getItem(k) { return this._map.has(k) ? this._map.get(k) : null; },
-  setItem(k, v) { this._map.set(k, String(v)); }
-};
+module.exports = { createHarness };
 
-const context = vm.createContext({
-  console: { log() {}, error() {} },
-  document: documentStub,
-  window: windowStub,
-  navigator: {},
-  localStorage: localStorageStub,
-  performance: { now: () => 0 },
-  requestAnimationFrame: () => 1,
-  setTimeout: callback => { timeouts.push(callback); return timeouts.length; },
-  clearTimeout: () => {}
-});
-windowStub.window = windowStub;
-
-vm.runInContext(fs.readFileSync(path.join(root, 'ui', 'anping-audio.js'), 'utf8'), context);
-context.AnPingAudio = windowStub.AnPingAudio;
-vm.runInContext(script, context);
-
-const origToast = context.toast;
-context.toast = text => { context.lastToast = text; origToast(text); };
-
-function receive(data) { listeners.message({ data }); }
-function category(files = []) {
-  return { id: 'tmp', name: '真实分类', total: 1, ok: 0, review: 1, keep: 0, count: files.length, files };
-}
+if (require.main === module) {
+const { context, windowStub, get, sent, docListeners, receive, category } = createHarness(process.argv[2]);
 function check(name, body) { body(); console.log('PASS ' + name); }
 
-check('native boot clears mock categories, exposes __auditEval, hides idle view-tabs, and upgrades home screen on initState', () => {
+check('native boot clears mock categories, omits __auditEval backdoor, hides idle view-tabs, and upgrades home screen on initState', () => {
   assert.equal(context.CATS.length, 0);
-  assert.equal(typeof windowStub.__auditEval, 'function');
-  assert.equal(windowStub.__auditEval('S.state'), 'first');
+  assert.equal(typeof windowStub.__auditEval, 'undefined');
+  assert.equal(context.S.state, 'first');
   // Fallback before initState (driveTotalBytes === 0)
   assert.equal(get('num').textContent, '尚未扫描');
   assert.equal(get('unit').textContent, '');
@@ -551,4 +561,58 @@ check('v0.9.0 drive space, UAC elevation, chat picker, merged drawer subcats, an
   void bar0Dist;
 });
 
-console.log('RESULT OK: modular UI regressions (DOM stand-in)');
+check('UI security hardening: esc(), confidenceHTML(), empty-state/sourceUrl, prototype-safe maps, CSS escaping, and bridge schema guards', () => {
+  // UI-03: single-quote & null/undefined escaping, confidenceHTML escaping
+  assert.equal(context.esc("'"), '&#39;');
+  assert.equal(context.esc('<img src="x" onerror=\'1\'>'), '&lt;img src=&quot;x&quot; onerror=&#39;1&#39;&gt;');
+  assert.equal(context.esc(null), '');
+  assert.equal(context.esc(undefined), '');
+  const conf = context.confidenceHTML('<img src=x onerror=1>');
+  assert(!conf.includes('<img') && conf.includes('&lt;img src=x onerror=1&gt;'), 'confidenceHTML must escape label in both aria-label and span');
+  assert(context.elevateRowHTML('a"b\'c').includes('a&quot;b&#39;c') || !context.canOfferElevate(), 'elevateRowHTML escapes id when offered');
+
+  // UI-03: dState.filter === "all" empty list must NOT render literal "undefined"; d.source without d.sourceUrl must NOT render "undefined"
+  context.dState = { g: null, filter: 'all', sort: 'size', open: Object.create(null), page: { files: [], offset: 0, limit: 100, total: 0, counts: { all: 0, ok: 0, review: 0, keep: 0 } } };
+  context.drawerOpen = true;
+  context.drawRender();
+  assert(!get('drawer').innerHTML.includes('undefined'), 'empty drawer list with filter=all must not contain literal undefined');
+
+  const noUrlFile = { id: 999, catId: 'tmp', n: 'note.dat', p: 'X:\\a\\', s: 0.001, j: 'review', r: 'R', why: 'W', mt: '2026-11-24', x: { detail: { type: '测试', confidence: '<script>1</script>', purpose: '用途', basis: '依据', risk: '低', riskText: '无', steps: ['保留'], evidence: [{ state: 'toString', text: '测试', strength: '弱' }], source: '仅来源无链接' } } };
+  context.openDirectoryFile(noUrlFile, '‹ 返回');
+  assert(!get('drawer').innerHTML.includes('undefined'), 'detail view with source and missing sourceUrl must not render literal undefined');
+  assert(!get('drawer').innerHTML.includes('<script>1</script>'), 'detail view must escape confidenceHTML');
+  assert(!get('drawer').innerHTML.includes('function toString'), 'evidence state lookup must not read Object.prototype');
+  context.closeDrawer();
+
+  // UI-06: dynamic querySelector escaping handles quotes/backslashes without throwing
+  context.dState = { g: null, filter: 'all', sort: 'size', open: Object.create(null), detailKey: 'tmp|bad\\"name\n.txt', listScroll: 0 };
+  context.backToList();
+  assert(context.dState.focusToken.includes('\\\\\\"'), 'backToList focusToken must escape backslash and quote');
+
+  // UI-07: prototype-key category ID must not produce NaN totals
+  receive({ action: 'scanStarted', scanSessionId: 91, target: 'X:\\' });
+  receive({ action: 'scanComplete', scanSessionId: 91, completed: true, categories: [{ id: 'toString', name: 'proto', total: 0.5, ok: 0.5, review: 0, keep: 0, count: 1, files: [] }] });
+  const tot = context.totals();
+  assert(Number.isFinite(tot.ok) && Math.abs(tot.ok - 0.5) < 1e-9, 'prototype-named category id must produce finite totals');
+
+  // UI-07: malformed bridge messages & missing scanSessionId on scan* must be ignored safely
+  const stateBefore = context.S.state;
+  receive(null);
+  receive([]);
+  receive(42);
+  receive({ action: 123 });
+  receive({ action: 'scanComplete', categories: [] }); // missing scanSessionId -> ignored
+  assert.equal(context.S.state, stateBefore, 'malformed or sessionless scanComplete must be ignored');
+  assert.equal(typeof windowStub.NATIVE_DRIVES, 'undefined', 'NATIVE_DRIVES must not leak on window');
+  assert.equal(typeof windowStub.NATIVE_CHAT_FOLDERS, 'undefined', 'NATIVE_CHAT_FOLDERS must not leak on window');
+});
+
+Promise.resolve(context.audio.play('toString')).then(res => {
+  assert.equal(res, false, "audio.play('toString') must return false without throwing");
+  console.log('PASS audio.play prototype key rejected without throwing');
+  console.log('RESULT OK: modular UI regressions (DOM stand-in)');
+}).catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});
+}

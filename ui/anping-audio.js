@@ -6,11 +6,11 @@ var CUES={
  click:{duration:.110,notes:[{at:0,duration:.110,frequency:1420,gain:.030,partial:2.08}]},
  complete:{duration:.440,notes:[{at:0,duration:.180,frequency:784,gain:.025,partial:2},{at:.240,duration:.200,frequency:1046.5,gain:.025,partial:2}]}
 };
-function Controller(options){this.options=options||{};this.enabled=false;this.context=null;this.nodes=new Set();this.generation=0;this.session=null;this.notified=null;this.pending=null;this.lastHover=-Infinity;this.lastResult={status:'muted'};}
+function Controller(options){this.options=options||{};this.enabled=false;this.context=null;this.nodes=new Set();this.generation=0;this.session=null;this.notified=null;this.pending=null;this.lastHover=-Infinity;this.lastClick=-Infinity;this.lastResult={status:'muted'};}
 Controller.prototype.report=function(status,kind,session){this.lastResult={status:status,kind:kind,session:session};if(this.options.onResult)this.options.onResult(this.lastResult);return status==='scheduled';};
 Controller.prototype.cancel=function(){this.generation++;this.pending=null;this.nodes.forEach(function(n){try{n.stop();}catch(_){}});this.nodes.clear();};
 Controller.prototype.setEnabled=function(value){this.enabled=!!value;if(!this.enabled)this.cancel();this.report(this.enabled?'enabled':'muted');};
-Controller.prototype.beginSession=function(id){this.cancel();this.session=id;this.notified=null;this.lastHover=-Infinity;};
+Controller.prototype.beginSession=function(id){this.cancel();this.session=id;this.notified=null;this.lastHover=-Infinity;this.lastClick=-Infinity;};
 Controller.prototype.stopSession=function(){this.cancel();this.session=null;};
 Controller.prototype.prepare=async function(){
  if(!this.context||this.context.state==='closed')this.context=this.options.createContext?this.options.createContext():new (global.AudioContext||global.webkitAudioContext)();
@@ -23,11 +23,11 @@ Controller.prototype.prepare=async function(){
 // 恢复已保存的开启状态后，在真实点击/按键中解锁，避免扫描结束才首次创建上下文。
 Controller.prototype.unlock=function(){if(!this.enabled)return;var self=this;this.prepare().then(function(ctx){if(self.enabled&&ctx.state!=='running')self.report('resume-failed','unlock',self.session);},function(e){if(self.enabled)self.report(e&&e.message==='resume-timeout'?'resume-timeout':'schedule-or-resume-failed','unlock',self.session);});};
 Controller.prototype.play=async function(kind,id){
- var cue=CUES[kind],self=this,token=this.generation;
+ var cue=typeof kind==='string'&&Object.prototype.hasOwnProperty.call(CUES,kind)?CUES[kind]:null,self=this,token=this.generation;
  if(!cue)return this.report('invalid-event',kind,id);
  if(!this.enabled)return this.report('muted',kind,id);
  if(kind==='complete'&&(id!==this.session||id===this.notified||this.pending===id))return this.report('stale-or-duplicate',kind,id);
- var now=this.options.now?this.options.now():performance.now();if(kind==='hover'&&now-this.lastHover<120)return this.report('throttled',kind,id);if(kind==='hover')this.lastHover=now;
+ var now=this.options.now?this.options.now():performance.now();if(kind==='hover'&&now-this.lastHover<120)return this.report('throttled',kind,id);if(kind==='hover')this.lastHover=now;if(kind==='click'&&now-this.lastClick<25)return this.report('throttled',kind,id);if(kind==='click')this.lastClick=now;
  if(kind==='complete')this.pending=id;
  var sources=[];
  try {

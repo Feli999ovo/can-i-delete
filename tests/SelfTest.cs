@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -66,6 +67,9 @@ public static class SelfTest
 
             Console.WriteLine("=== Group E: v1.0.0 Host Hardening, Log Rotation, Single-Instance & Binary Metadata ===");
             RunGroupE(sandbox);
+
+            Console.WriteLine("=== Group F: Full-Stack Security Audit Regression Suite (F1-F7) ===");
+            RunGroupF(sandbox);
         }
         catch (Exception ex)
         {
@@ -2096,6 +2100,518 @@ public static class SelfTest
     }
 
     // =====================================================================
+    // Group F: Full-Stack Security Audit Regression Suite (F1-F7)
+    // =====================================================================
+    private static void RunGroupF(string sandbox)
+    {
+        // --- F1 (RULE-01): Real Office OOXML OPC Bypass vs Genuine .nupkg / .vsix ---
+        string f1Root = Path.Combine(sandbox, "groupF-f1");
+        string f1Yarn = Path.Combine(f1Root, "Yarn", "Cache");
+        string f1Nuget = Path.Combine(f1Root, "NuGet", "v3-cache");
+        string f1Temp = Path.Combine(f1Root, "Temp");
+        string f1Inno = Path.Combine(f1Temp, "is-abc12.tmp");
+        string f1Vsix = Path.Combine(f1Root, "Code", "CachedExtensionVsiXs");
+        Directory.CreateDirectory(f1Yarn);
+        Directory.CreateDirectory(f1Nuget);
+        Directory.CreateDirectory(f1Inno);
+        Directory.CreateDirectory(f1Vsix);
+
+        CacheRoots.ClearInjectedForTest();
+        try
+        {
+            CacheRoots.InjectForTest("TMP-PKGCACHE", f1Yarn);
+            CacheRoots.InjectForTest("TMP-PKGCACHE", f1Nuget);
+            CacheRoots.InjectForTest("TMP-SYSTEMP", f1Temp);
+            CacheRoots.InjectForTest("TMP-APPCACHE", f1Vsix);
+
+            byte[] contentTypesXml = Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>");
+            byte[] wordDocXml = Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><w:document/>");
+            byte[] nuspecXml = Encoding.UTF8.GetBytes("<?xml version=\"1.0\"?><package><metadata><id>demo</id></metadata></package>");
+            byte[] extPkgJson = Encoding.UTF8.GetBytes("{\"name\":\"demo-ext\",\"version\":\"1.0.0\"}");
+
+            string[] opcOfficeEntries = new string[] { "[Content_Types].xml", "word/document.xml" };
+            byte[][] opcOfficeBodies = new byte[][] { contentTypesXml, wordDocXml };
+
+            string yarnOpcDoc = Path.Combine(f1Yarn, "real-office-opc.zip");
+            WriteMultiEntryZip(yarnOpcDoc, opcOfficeEntries, opcOfficeBodies);
+
+            string tempOpcDoc = Path.Combine(f1Inno, "real-office-opc.zip");
+            WriteMultiEntryZip(tempOpcDoc, opcOfficeEntries, opcOfficeBodies);
+            File.SetLastWriteTimeUtc(tempOpcDoc, DateTime.UtcNow.AddHours(-60));
+
+            string vsixOpcDoc = Path.Combine(f1Vsix, "real-office-opc.vsix");
+            WriteMultiEntryZip(vsixOpcDoc, opcOfficeEntries, opcOfficeBodies);
+
+            Check("F1a: Real ECMA-376 OPC Office .zip rejected in Yarn\\Cache, Temp\\is-abc12.tmp (>48h) & Code\\CachedExtensionVsiXs",
+                !DecideFile(yarnOpcDoc).PolicyEligible
+                && !DecideFile(tempOpcDoc).PolicyEligible
+                && !DecideFile(vsixOpcDoc).PolicyEligible);
+
+            string yarnStreamErr, tempStreamErr, vsixStreamErr;
+            using (FileStream fs = File.OpenRead(yarnOpcDoc))
+                yarnStreamErr = CacheRuleRegistry.Find("TMP-PKGCACHE").VerifyStream(yarnOpcDoc, fs);
+            using (FileStream fs = File.OpenRead(tempOpcDoc))
+                tempStreamErr = CacheRuleRegistry.Find("TMP-SYSTEMP").VerifyStream(tempOpcDoc, fs);
+            using (FileStream fs = File.OpenRead(vsixOpcDoc))
+                vsixStreamErr = CacheRuleRegistry.Find("TMP-APPCACHE").VerifyStream(vsixOpcDoc, fs);
+            Check("F1b: Delete-time VerifyStream also rejects real ECMA-376 OPC Office .zip across all 3 rules",
+                yarnStreamErr != null && tempStreamErr != null && vsixStreamErr != null);
+
+            string legitNupkg = Path.Combine(f1Nuget, "demo.1.0.0.nupkg");
+            WriteMultiEntryZip(legitNupkg,
+                new string[] { "[Content_Types].xml", "demo.nuspec" },
+                new byte[][] { contentTypesXml, nuspecXml });
+
+            string legitVsix = Path.Combine(f1Vsix, "legit-opc.vsix");
+            WriteMultiEntryZip(legitVsix,
+                new string[] { "[Content_Types].xml", "extension/package.json" },
+                new byte[][] { contentTypesXml, extPkgJson });
+
+            Evidence nupkgEv = DecideFile(legitNupkg);
+            Evidence vsixEv = DecideFile(legitVsix);
+            string nupkgStreamErr, legitVsixStreamErr;
+            using (FileStream fs = File.OpenRead(legitNupkg))
+                nupkgStreamErr = CacheRuleRegistry.Find("TMP-PKGCACHE").VerifyStream(legitNupkg, fs);
+            using (FileStream fs = File.OpenRead(legitVsix))
+                legitVsixStreamErr = CacheRuleRegistry.Find("TMP-APPCACHE").VerifyStream(legitVsix, fs);
+
+            Check("F1c: Genuine OPC .nupkg ([Content_Types].xml + demo.nuspec) & .vsix ([Content_Types].xml + extension/package.json) remain PolicyEligible",
+                nupkgEv.PolicyEligible && nupkgEv.RuleId == "TMP-PKGCACHE" && nupkgStreamErr == null
+                && vsixEv.PolicyEligible && vsixEv.RuleId == "TMP-APPCACHE" && legitVsixStreamErr == null);
+
+            // F1d: Truncated OPC Central Directory (scanned < totalEntries) & corrupt totalEntries==0 with cdSize>0 fail closed
+            string truncOpcZip = Path.Combine(f1Yarn, "truncated_opc.zip");
+            WriteCraftedEocdZip(truncOpcZip, "[Content_Types].xml", contentTypesXml, 2, false, false);
+            string zeroEntriesCorruptZip = Path.Combine(f1Yarn, "zero_entries_corrupt.zip");
+            WriteCraftedEocdZip(zeroEntriesCorruptZip, "entry.txt", Encoding.ASCII.GetBytes("payload"), 0, false, false);
+
+            string truncStreamErr, zeroStreamErr;
+            using (FileStream fs = File.OpenRead(truncOpcZip))
+                truncStreamErr = CacheRuleRegistry.Find("TMP-PKGCACHE").VerifyStream(truncOpcZip, fs);
+            using (FileStream fs = File.OpenRead(zeroEntriesCorruptZip))
+                zeroStreamErr = CacheRuleRegistry.Find("TMP-PKGCACHE").VerifyStream(zeroEntriesCorruptZip, fs);
+            Check("F1d: Truncated OPC CD (scanned < totalEntries) & corrupt totalEntries==0 (cdSize>0) fail closed at scan & delete",
+                !DecideFile(truncOpcZip).PolicyEligible && truncStreamErr != null
+                && !DecideFile(zeroEntriesCorruptZip).PolicyEligible && zeroStreamErr != null);
+
+            // F1e: ZIP64 Office fail-closed (even when entry #1 is NOT [Content_Types].xml) vs non-OPC .nupkg allowed
+            string zip64Yarn = Path.Combine(f1Yarn, "zip64_doc.zip");
+            WriteCraftedEocdZip(zip64Yarn, "doc.bin", Encoding.ASCII.GetBytes("data"), 0xFFFF, true, false);
+            string zip64Temp = Path.Combine(f1Inno, "zip64_doc.zip");
+            WriteCraftedEocdZip(zip64Temp, "doc.bin", Encoding.ASCII.GetBytes("data"), 0xFFFF, true, false);
+            File.SetLastWriteTimeUtc(zip64Temp, DateTime.UtcNow.AddHours(-60));
+            string zip64OpcNupkg = Path.Combine(f1Nuget, "zip64_opc.nupkg");
+            WriteCraftedEocdZip(zip64OpcNupkg, "[Content_Types].xml", contentTypesXml, 0xFFFF, true, false);
+            string zip64LegitNupkg = Path.Combine(f1Nuget, "zip64_legit.nupkg");
+            WriteCraftedEocdZip(zip64LegitNupkg, "demo.nuspec", nuspecXml, 0xFFFF, true, false);
+
+            string z64YarnErr, z64TempErr;
+            using (FileStream fs = File.OpenRead(zip64Yarn))
+                z64YarnErr = CacheRuleRegistry.Find("TMP-PKGCACHE").VerifyStream(zip64Yarn, fs);
+            using (FileStream fs = File.OpenRead(zip64Temp))
+                z64TempErr = CacheRuleRegistry.Find("TMP-SYSTEMP").VerifyStream(zip64Temp, fs);
+            Check("F1e: ZIP64 .zip & OPC ZIP64 .nupkg fail closed while non-OPC ZIP64 .nupkg stays eligible",
+                !DecideFile(zip64Yarn).PolicyEligible && z64YarnErr != null
+                && !DecideFile(zip64Temp).PolicyEligible && z64TempErr != null
+                && !DecideFile(zip64OpcNupkg).PolicyEligible
+                && DecideFile(zip64LegitNupkg).PolicyEligible);
+        }
+        finally
+        {
+            CacheRoots.ClearInjectedForTest();
+        }
+
+        // --- F2 (ENG-01 / RULE-02): Ancestor-Above-ScanRoot Junction & Final-Path Verification ---
+        string f2Root = Path.Combine(sandbox, "groupF-f2");
+        string f2Protected = Path.Combine(f2Root, "ProtectedTarget");
+        string f2ProtectedSub = Path.Combine(f2Protected, "sub");
+        string f2Temp = Path.Combine(f2Root, "Temp");
+        string f2Junc = Path.Combine(f2Temp, "is-junc1.tmp");
+        Directory.CreateDirectory(f2ProtectedSub);
+        Directory.CreateDirectory(f2Temp);
+
+        string f2VictimReal = Path.Combine(f2ProtectedSub, "victim.dll");
+        WritePeExe(f2VictimReal);
+        File.SetLastWriteTimeUtc(f2VictimReal, DateTime.UtcNow.AddHours(-60));
+
+        bool f2JuncCreated = TryCreateJunction(f2Junc, f2Protected);
+        Check("F2a: Sandbox junction created for ancestor-above-scanroot test", f2JuncCreated);
+        if (f2JuncCreated)
+        {
+            try
+            {
+                string f2JuncSub = Path.Combine(f2Junc, "sub");
+                string f2JuncVictim = Path.Combine(f2JuncSub, "victim.dll");
+
+                ScanSessionHost scanHost = new ScanSessionHost();
+                string startWhy;
+                bool started = scanHost.StartTargets(new string[] { f2JuncSub }, new ScanBudget(), out startWhy);
+                Check("F2b: ScanSessionHost.StartTargets rejects scan root beneath ancestor junction",
+                    !started && !string.IsNullOrEmpty(startWhy));
+
+                CacheRoots.InjectForTest("TMP-SYSTEMP", f2Temp);
+                FileInfo victimFi = new FileInfo(f2VictimReal);
+                FileIdentity victimId = FileIdentityProbe.Capture(f2VictimReal);
+
+                List<DeleteRequest> f2Reqs = new List<DeleteRequest>();
+                f2Reqs.Add(new DeleteRequest
+                {
+                    Path = f2JuncVictim,
+                    WasDirectory = false,
+                    BytesAtScan = victimFi.Length,
+                    LastWriteUtcAtScan = victimFi.LastWriteTimeUtc,
+                    PolicyEligible = true,
+                    Risk = EvidenceRules.RiskSafe,
+                    IdAtScan = victimId
+                });
+                string f2Log = Path.Combine(f2Root, "f2-delete-log.txt");
+                List<DeleteOutcome> f2Outs = DeleteEngine.Execute(f2Reqs, new string[] { f2JuncSub }, new PermanentDeleteBin(), f2Log);
+                Check("F2c: DeleteEngine.Execute refuses to delete victim.dll through ancestor junction",
+                    f2Outs.Count == 1
+                    && f2Outs[0].Status != DeleteStatus.DeletedVerified
+                    && File.Exists(f2VictimReal));
+
+                string directDelErr = PermanentDeleteBin.DeleteVerified(f2JuncVictim, victimId, victimFi.Length, victimFi.LastWriteTimeUtc, null);
+                Check("F2d: PermanentDeleteBin.DeleteVerified final-path verification refuses junctioned victim.dll",
+                    directDelErr != null && File.Exists(f2VictimReal));
+
+                FileIdentity juncId = FileIdentityProbe.Capture(f2Junc);
+                LockState juncLock = LockProbe.Probe(f2Junc);
+                Check("F2e: FileIdentityProbe.Capture returns Ok==false & LockProbe.Probe returns LockState.Unknown on junction",
+                    !juncId.Ok && juncLock == LockState.Unknown);
+            }
+            finally
+            {
+                CacheRoots.ClearInjectedForTest();
+                try { if (Directory.Exists(f2Junc)) Directory.Delete(f2Junc, false); } catch { }
+            }
+        }
+
+        // --- F3 (RULE-04): CanonicalFast ADS & Drive Root ---
+        Check("F3a: PathGuard.Canonical preserves drive root C:\\ and IsInside(C:\\, C:\\Windows) is true",
+            PathGuard.Canonical("C:\\") == "C:\\"
+            && PathGuard.IsInside("C:\\", "C:\\Windows"));
+
+        Check("F3b: PathGuard.Canonical & CanonicalFast reject NTFS ADS (C:\\Temp\\a.tmp:ads)",
+            PathGuard.Canonical("C:\\Temp\\a.tmp:ads") == ""
+            && PathGuard.CanonicalFast("C:\\Temp\\a.tmp:ads") == "");
+
+        string f3Temp = Path.Combine(sandbox, "groupF-f3", "Temp");
+        Directory.CreateDirectory(f3Temp);
+        CacheRoots.ClearInjectedForTest();
+        try
+        {
+            CacheRoots.InjectForTest("TMP-SYSTEMP", f3Temp);
+            string mRuleAds, mWhyAds, mRuleNorm, mWhyNorm;
+            bool adsMatch = CacheRoots.Match(Path.Combine(f3Temp, "a.tmp:ads"), out mRuleAds, out mWhyAds);
+            bool normMatch = CacheRoots.Match(Path.Combine(f3Temp, "a.tmp"), out mRuleNorm, out mWhyNorm);
+            Check("F3c: CacheRoots.Match rejects NTFS ADS path while matching normal path",
+                !adsMatch && normMatch && mRuleNorm == "TMP-SYSTEMP");
+
+            int gen1, gen2;
+            CacheRuleRegistry.RefreshRootsCache();
+            CacheRoots.Root[] roots1 = CacheRuleRegistry.DiscoverExistingRootsCached(out gen1);
+            CacheRuleRegistry.RefreshRootsCache();
+            CacheRoots.Root[] roots2 = CacheRuleRegistry.DiscoverExistingRootsCached(out gen2);
+            Check("F3d: DiscoverExistingRootsCached advances valid generation (>0) cleanly across RefreshRootsCache",
+                roots1 != null && roots2 != null && gen1 > 0 && gen2 > gen1);
+        }
+        finally
+        {
+            CacheRoots.ClearInjectedForTest();
+        }
+
+        // --- F4 (RULE-05 & RULE-16): Expanded KEEP-* Protection ---
+        Evidence wuDsEv = EvidenceRules.Evaluate("DataStore.edb", @"C:\Windows\SoftwareDistribution\DataStore\DataStore.edb", 100);
+        Evidence hiberEv = EvidenceRules.Evaluate("hiberfil.sys", @"C:\hiberfil.sys", 100);
+        Check("F4a: KEEP-SYSTEM catches SoftwareDistribution\\DataStore\\DataStore.edb & C:\\hiberfil.sys",
+            wuDsEv.Risk == EvidenceRules.RiskKeep && wuDsEv.RuleId == "KEEP-SYSTEM" && !wuDsEv.PolicyEligible
+            && hiberEv.Risk == EvidenceRules.RiskKeep && hiberEv.RuleId == "KEEP-SYSTEM" && !hiberEv.PolicyEligible);
+
+        Evidence xwDbEv = EvidenceRules.Evaluate("message.db", @"D:\xwechat_files\wxid_1\db_storage\message.db", 100);
+        Evidence qqDbEv = EvidenceRules.Evaluate("Msg3.0.db", @"D:\Tencent Files\10001\Msg3.0.db", 100);
+        Evidence qqJrnEv = EvidenceRules.Evaluate("Msg3.0.db-journal", @"D:\Tencent Files\10001\Msg3.0.db-journal", 100);
+        Evidence wcJrnEv = EvidenceRules.Evaluate("MSG0.db-journal", @"D:\WeChat Files\wxid_1\Msg\MSG0.db-journal", 100);
+        Check("F4b: KEEP-CHATDB catches WeChat 4.x db_storage, QQ Msg3.0.db & .db-journal",
+            xwDbEv.Risk == EvidenceRules.RiskKeep && xwDbEv.RuleId == "KEEP-CHATDB" && !xwDbEv.PolicyEligible
+            && qqDbEv.Risk == EvidenceRules.RiskKeep && qqDbEv.RuleId == "KEEP-CHATDB" && !qqDbEv.PolicyEligible
+            && qqJrnEv.Risk == EvidenceRules.RiskKeep && qqJrnEv.RuleId == "KEEP-CHATDB" && !qqJrnEv.PolicyEligible
+            && wcJrnEv.Risk == EvidenceRules.RiskKeep && wcJrnEv.RuleId == "KEEP-CHATDB" && !wcJrnEv.PolicyEligible);
+
+        Evidence patchMsiEv = EvidenceRules.Evaluate("x.msi", @"C:\Windows\Installer\$PatchCache$\Managed\x.msi", 100);
+        Check("F4c: KEEP-MSICACHE catches Windows\\Installer\\$PatchCache$\\Managed\\x.msi",
+            patchMsiEv.Risk == EvidenceRules.RiskKeep && patchMsiEv.RuleId == "KEEP-MSICACHE" && !patchMsiEv.PolicyEligible);
+
+        Evidence singletonEv = EvidenceRules.Evaluate("SingletonLock", @"C:\Temp\SingletonLock", 100);
+        Evidence lckEv = EvidenceRules.Evaluate("app.lck", @"C:\Temp\app.lck", 100);
+        string chatDbLabel = ScanText.RuleLabel("KEEP-CHATDB");
+        Check("F4d: KEEP-LOCK catches SingletonLock & app.lck, and ScanText.RuleLabel maps KEEP-CHATDB",
+            singletonEv.Risk == EvidenceRules.RiskKeep && singletonEv.RuleId == "KEEP-LOCK" && !singletonEv.PolicyEligible
+            && lckEv.Risk == EvidenceRules.RiskKeep && lckEv.RuleId == "KEEP-LOCK" && !lckEv.PolicyEligible
+            && !string.IsNullOrEmpty(chatDbLabel) && chatDbLabel != "KEEP-CHATDB");
+
+        // --- F5 (RULE-03 / RULE-09): Untrusted .ini & Protected Browser/App Paths ---
+        string f5Root = Path.Combine(sandbox, "groupF-f5");
+        string f5Docs = Path.Combine(f5Root, "Docs");
+        string f5Target = Path.Combine(f5Root, "RealTarget");
+        string f5Junc = Path.Combine(f5Root, "JuncDir");
+        Directory.CreateDirectory(f5Docs);
+        Directory.CreateDirectory(f5Target);
+        bool f5JuncOk = TryCreateJunction(f5Junc, f5Target);
+        try
+        {
+            string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string iniWin = ChatStorageLocator.ParseWeChatConfigIniContent(@"C:\Windows", f5Docs);
+            string iniWinEnv = ChatStorageLocator.ParseWeChatConfigIniContent(winDir, f5Docs);
+            string iniUnc = ChatStorageLocator.ParseWeChatConfigIniContent(@"\\attacker\share\WeChat Files", f5Docs);
+            string iniJunc = f5JuncOk ? ChatStorageLocator.ParseWeChatConfigIniContent(f5Junc, f5Docs) : "";
+            string iniJuncSub = f5JuncOk ? ChatStorageLocator.ParseWeChatConfigIniContent(Path.Combine(f5Junc, "WeChat Files"), f5Docs) : "";
+            Check("F5a: ParseWeChatConfigIniContent rejects C:\\Windows, UNC & junction-containing paths",
+                f5JuncOk && iniWin == "" && iniWinEnv == "" && iniUnc == "" && iniJunc == "" && iniJuncSub == "");
+        }
+        finally
+        {
+            try { if (Directory.Exists(f5Junc)) Directory.Delete(f5Junc, false); } catch { }
+        }
+
+        Check("F5b: CacheRoots.IsBrowserProtectedPath catches Local State, Extension Cookies, Login Data-wal & prefs.js",
+            CacheRoots.IsBrowserProtectedPath("Local State", @"C:\Users\u\AppData\Local\Google\Chrome\User Data\Local State")
+            && CacheRoots.IsBrowserProtectedPath("Extension Cookies", @"C:\Users\u\AppData\Local\Microsoft\Edge\User Data\Default\Extension Cookies")
+            && CacheRoots.IsBrowserProtectedPath("Login Data-wal", @"C:\Users\u\AppData\Local\Google\Chrome\User Data\Default\Login Data-wal")
+            && CacheRoots.IsBrowserProtectedPath("prefs.js", @"C:\Users\u\AppData\Roaming\Mozilla\Firefox\Profiles\p.default\prefs.js")
+            && CacheRoots.IsAppProtectedPath("settings.json", @"C:\Users\u\AppData\Roaming\Code - Insiders\User\settings.json"));
+
+        MethodInfo skipMethod = typeof(CacheRuleRegistry).GetMethod("ShouldSkipAppTopLevelName", BindingFlags.NonPublic | BindingFlags.Static);
+        bool skipTencent = skipMethod != null && (bool)skipMethod.Invoke(null, new object[] { "Tencent" });
+        bool skipWeChat = skipMethod != null && (bool)skipMethod.Invoke(null, new object[] { "WeChat" });
+        bool skipQq = skipMethod != null && (bool)skipMethod.Invoke(null, new object[] { "QQ" });
+        bool skipKeePassXc = skipMethod != null && (bool)skipMethod.Invoke(null, new object[] { "KeePassXC" });
+        bool skipBenign = skipMethod != null && (bool)skipMethod.Invoke(null, new object[] { "DemoElectronApp" });
+        Check("F5c: ShouldSkipAppTopLevelName excludes Tencent, WeChat, QQ & KeePassXC (while allowing benign app name)",
+            skipTencent && skipWeChat && skipQq && skipKeePassXc && !skipBenign);
+
+        // F5d (RULE-03): All Users fallback requires genuine WeChat signature, rejects UserProfile/Documents & non-fixed drives
+        string f5FakeAllUsers = Path.Combine(f5Root, "FakeAllUsersDir");
+        Directory.CreateDirectory(Path.Combine(Path.Combine(f5FakeAllUsers, "All Users"), "config"));
+        string f5RealAllUsers = Path.Combine(f5Root, "RealWeChatAllUsers");
+        string f5RealAuConfig = Path.Combine(Path.Combine(f5RealAllUsers, "All Users"), "config");
+        Directory.CreateDirectory(f5RealAuConfig);
+        File.WriteAllText(Path.Combine(f5RealAuConfig, "config.data"), "wechat-sig");
+        string parsedFakeAu = ChatStorageLocator.ParseWeChatConfigIniContent(f5FakeAllUsers, f5Docs);
+        string parsedRealAu = ChatStorageLocator.ParseWeChatConfigIniContent(f5RealAllUsers, f5Docs);
+        string userProfDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string parsedUserProf = ChatStorageLocator.ParseWeChatConfigIniContent(userProfDir, f5Docs);
+        string nonFixedProbe = "";
+        for (char drv = 'Z'; drv >= 'F'; drv--)
+        {
+            string probePath = drv + ":\\WeChatData";
+            if (!PathGuard.IsFixedLocalDrive(probePath)) { nonFixedProbe = probePath; break; }
+        }
+        bool nonFixedRejected = string.IsNullOrEmpty(nonFixedProbe)
+            || ChatStorageLocator.ParseWeChatConfigIniContent(nonFixedProbe, f5Docs) == "";
+        Check("F5d: ParseWeChatConfigIniContent requires WeChat signature for All Users fallback, never mounts UserProfile directly & rejects non-fixed drives",
+            !string.Equals(parsedFakeAu, PathGuard.Canonical(f5FakeAllUsers), StringComparison.OrdinalIgnoreCase)
+            && string.Equals(parsedRealAu, PathGuard.Canonical(f5RealAllUsers), StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(parsedUserProf, PathGuard.Canonical(userProfDir), StringComparison.OrdinalIgnoreCase)
+            && nonFixedRejected);
+
+        // --- F6 (ENG-04 / ENG-05 / ENG-06 / ENG-07 / ENG-10 / ENG-11 / RULE-13) ---
+        string f6Root = Path.Combine(sandbox, "groupF-f6");
+        Directory.CreateDirectory(f6Root);
+
+        string f6EscapeLog = Path.Combine(f6Root, "escape-log.txt");
+        string f6Why;
+        string evilOpId = "op_f6\r\nO\top=forged_op\tstatus=DeletedVerified";
+        string evilBatchId = "batch_f6\r\n\tinjected";
+        string f6Target = Path.Combine(f6Root, "dummy.tmp");
+        DeleteRequest f6Req = new DeleteRequest { Path = f6Target, BytesAtScan = 16, PolicyEligible = true, Risk = EvidenceRules.RiskSafe };
+        bool wroteEscaped = DeleteLog.WriteIntent(f6EscapeLog, evilOpId, evilBatchId, f6Req, f6Target, out f6Why);
+        string[] rawEscLines = File.Exists(f6EscapeLog) ? File.ReadAllLines(f6EscapeLog, Encoding.UTF8) : new string[0];
+        bool hasForgedOutcomeLine = false;
+        int intentLineCount = 0;
+        for (int i = 0; i < rawEscLines.Length; i++)
+        {
+            string line = rawEscLines[i];
+            if (line.StartsWith("O\t", StringComparison.Ordinal)) hasForgedOutcomeLine = true;
+            string[] cols = line.Split('\t');
+            if (cols.Length >= 2)
+            {
+                if (cols[1] == DeleteLog.OutcomeMark) hasForgedOutcomeLine = true;
+                if (cols[1] == DeleteLog.IntentMark) intentLineCount++;
+            }
+        }
+        bool hasEscapedOpAndBatch = rawEscLines.Length == 1
+            && rawEscLines[0].IndexOf("\top=" + DeleteLog.Esc(evilOpId), StringComparison.Ordinal) >= 0
+            && rawEscLines[0].IndexOf("\tbatch=" + DeleteLog.Esc(evilBatchId), StringComparison.Ordinal) >= 0;
+        List<KeyValuePair<string, string>> escPending = DeleteLog.PendingOps(f6EscapeLog);
+        Check("F6a: DeleteLog escapes embedded \\r\\n\\t in opId/batchId (no forged O line, exact round-trip)",
+            wroteEscaped && !hasForgedOutcomeLine && intentLineCount == 1 && hasEscapedOpAndBatch
+            && escPending.Count == 1 && escPending[0].Key == evilOpId && escPending[0].Value == f6Target);
+
+        string f6RealLogDir = Path.Combine(f6Root, "real-log-dir");
+        string f6JuncLogDir = Path.Combine(f6Root, "junc-log-dir");
+        Directory.CreateDirectory(f6RealLogDir);
+        bool f6JuncOk = TryCreateJunction(f6JuncLogDir, f6RealLogDir);
+        try
+        {
+            string juncLogPath = Path.Combine(f6JuncLogDir, "delete-log.txt");
+            string openWhy;
+            DeleteLog.WriterSession juncSession = DeleteLog.OpenSession(juncLogPath, out openWhy);
+            bool refusedJunc = (juncSession == null && !string.IsNullOrEmpty(openWhy) && !File.Exists(Path.Combine(f6RealLogDir, "delete-log.txt")));
+            if (juncSession != null) juncSession.Dispose();
+            Check("F6b: DeleteLog.OpenSession refuses junctioned/reparse log target without creating target file",
+                f6JuncOk && refusedJunc);
+
+            // F6f (ENG-05): TryPendingOps & DeleteEngine.Reconcile fail closed on unreadable/junctioned/dir log, while fresh missing log stays empty
+            List<KeyValuePair<string, string>> juncPending;
+            string juncPendingErr;
+            bool juncTryOk = DeleteLog.TryPendingOps(juncLogPath, out juncPending, out juncPendingErr);
+            List<DeleteOutcome> juncRecon = DeleteEngine.Reconcile(juncLogPath);
+
+            string f6DirAsLog = Path.Combine(f6Root, "dir-as-log");
+            Directory.CreateDirectory(f6DirAsLog);
+            List<KeyValuePair<string, string>> dirPending;
+            string dirPendingErr;
+            bool dirTryOk = DeleteLog.TryPendingOps(f6DirAsLog, out dirPending, out dirPendingErr);
+            List<DeleteOutcome> dirRecon = DeleteEngine.Reconcile(f6DirAsLog);
+
+            List<DeleteOutcome> freshRecon = DeleteEngine.Reconcile(Path.Combine(f6Root, "never-created-log.txt"));
+            Check("F6f: TryPendingOps & Reconcile fail closed on junctioned/directory log (locking cleaning) while fresh missing log stays empty",
+                !juncTryOk && !string.IsNullOrEmpty(juncPendingErr)
+                && juncRecon.Count == 1 && juncRecon[0].Status == DeleteStatus.PendingReconciliation
+                && juncRecon[0].Dispatch == DispatchState.Unknown && juncRecon[0].Detail.StartsWith("审计日志不可读：", StringComparison.Ordinal)
+                && !dirTryOk && !string.IsNullOrEmpty(dirPendingErr)
+                && dirRecon.Count == 1 && dirRecon[0].Status == DeleteStatus.PendingReconciliation
+                && dirRecon[0].Detail.StartsWith("审计日志不可读：", StringComparison.Ordinal)
+                && freshRecon.Count == 0);
+        }
+        finally
+        {
+            try { if (Directory.Exists(f6JuncLogDir)) Directory.Delete(f6JuncLogDir, false); } catch { }
+        }
+
+        bool budgetThrew = false;
+        ScanBudget weirdBudget = null;
+        try
+        {
+            weirdBudget = ScanSessionHost.BudgetFromEnvironment("time=NaN;hash=-1");
+        }
+        catch
+        {
+            budgetThrew = true;
+        }
+        bool hashLimited = weirdBudget != null && weirdBudget.MaxHashBytes > 0 && !(new HashBudget(weirdBudget.MaxHashBytes).IsUnlimited);
+        Check("F6c: BudgetFromEnvironment(\"time=NaN;hash=-1\") does not throw & does not create unlimited HashBudget",
+            !budgetThrew && weirdBudget != null && weirdBudget.MaxDuration > TimeSpan.Zero && hashLimited);
+
+        string[] unconfRules = new string[] { "stale-sentinel" };
+        var dumpNoConfMsg = new Dictionary<string, object>
+        {
+            { "scanSessionId", 9L },
+            { "rules", new ArrayList { "TMP-CRASHDUMP" } }
+        };
+        string dumpNoConfErr = CleanSelection.Validate(dumpNoConfMsg, 9L, out unconfRules);
+
+        string[] zeroSessRules = new string[] { "stale-sentinel" };
+        var zeroSessMsg = new Dictionary<string, object>
+        {
+            { "scanSessionId", 0L },
+            { "rules", new ArrayList { "TMP-SYSTEMP" } }
+        };
+        string zeroSessErr = CleanSelection.Validate(zeroSessMsg, 0L, out zeroSessRules);
+
+        string[] negSessRules = new string[] { "stale-sentinel" };
+        var negSessMsg = new Dictionary<string, object>
+        {
+            { "scanSessionId", -1L },
+            { "rules", new ArrayList { "TMP-SYSTEMP" } }
+        };
+        string negSessErr = CleanSelection.Validate(negSessMsg, -1L, out negSessRules);
+
+        Check("F6d: CleanSelection.Validate leaves out rules==null on unconfirmed TMP-CRASHDUMP & rejects session <= 0",
+            dumpNoConfErr != null && unconfRules == null
+            && zeroSessErr != null && zeroSessRules == null
+            && negSessErr != null && negSessRules == null);
+
+        string rbReason;
+        DeleteRefusalKind rbKind;
+        bool negBytesOk = RecycleBinProbe.IsSupported(Path.Combine(f6Root, "a.tmp"), -1, true, out rbReason, out rbKind);
+        bool longPathOk = RecycleBinProbe.IsSupported("C:\\" + new string('a', 265) + ".tmp", 128, true, out rbReason, out rbKind);
+        Check("F6e: RecycleBinProbe.IsSupported rejects negative bytes & >=260-char paths",
+            !negBytesOk && !longPathOk);
+
+        // --- F7 (HOST-07 / HOST-10 / HOST-02 / HOST-01) ---
+        string f7Root = Path.Combine(sandbox, "groupF-f7");
+        string f7Target = Path.Combine(f7Root, "target");
+        string f7Junc = Path.Combine(f7Root, "junc");
+        Directory.CreateDirectory(f7Target);
+        string f7CommaFile = Path.Combine(f7Target, "a,b.txt");
+        string f7NormalFile = Path.Combine(f7Target, "normal.txt");
+        File.WriteAllText(f7CommaFile, "comma");
+        File.WriteAllText(f7NormalFile, "normal");
+        bool f7JuncOk = TryCreateJunction(f7Junc, f7Target);
+        try
+        {
+            string rExe, rArgs, rWhy;
+            bool uncOk = Program.TryBuildRevealCommand(@"\\attacker\share\a.txt", out rExe, out rArgs, out rWhy);
+            bool commaOk = Program.TryBuildRevealCommand(f7CommaFile, out rExe, out rArgs, out rWhy);
+            bool juncDirOk = f7JuncOk && Program.TryBuildRevealCommand(f7Junc, out rExe, out rArgs, out rWhy);
+            bool juncFileOk = f7JuncOk && Program.TryBuildRevealCommand(Path.Combine(f7Junc, "normal.txt"), out rExe, out rArgs, out rWhy);
+            bool normalOk = Program.TryBuildRevealCommand(f7NormalFile, out rExe, out rArgs, out rWhy);
+            Check("F7a: TryBuildRevealCommand rejects UNC, commas & reparse points while allowing normal local file",
+                f7JuncOk && !uncOk && !commaOk && !juncDirOk && !juncFileOk && normalOk);
+        }
+        finally
+        {
+            try { if (Directory.Exists(f7Junc)) Directory.Delete(f7Junc, false); } catch { }
+        }
+
+        bool relaunchCancelled;
+        string relaunchErr;
+        bool evilRelaunchOk = Program.TryRelaunchAsAdmin("--evil", out relaunchCancelled, out relaunchErr);
+        Check("F7b: TryRelaunchAsAdmin rejects disallowed args (\"--evil\") without launching",
+            !evilRelaunchOk && !relaunchCancelled && !string.IsNullOrEmpty(relaunchErr));
+
+        Assembly badAsm1 = Program.OnAssemblyResolve(null, new ResolveEventArgs("EvilNotAllowed, Version=1.0.0.0"));
+        Assembly badAsm2 = Program.OnAssemblyResolve(null, new ResolveEventArgs("System.Data"));
+        Check("F7c: OnAssemblyResolve rejects non-allowlisted assembly names",
+            badAsm1 == null && badAsm2 == null);
+
+        string prevWvArgs = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+        string prevWvFolder = Environment.GetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
+        string prevWvPipe = Environment.GetEnvironmentVariable("WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER");
+        string prevWvWait = Environment.GetEnvironmentVariable("WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER");
+        string prevForcedHost = Environment.GetEnvironmentVariable("COREWEBVIEW2_FORCED_HOSTING_MODE");
+        string prevWvUserData = Environment.GetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER");
+        try
+        {
+            Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--remote-debugging-port=9222");
+            Environment.SetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", @"C:\EvilBrowser");
+            Environment.SetEnvironmentVariable("WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER", "evil-debugger-pipe");
+            Environment.SetEnvironmentVariable("WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER", "1");
+            Environment.SetEnvironmentVariable("COREWEBVIEW2_FORCED_HOSTING_MODE", "1");
+            Environment.SetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER", @"C:\KeepSentinelUserData");
+            Program.ClearSensitiveWebView2EnvironmentOverrides();
+            Check("F7d: ClearSensitiveWebView2EnvironmentOverrides strips all WEBVIEW2_* (incl. debugger vars) & COREWEBVIEW2_FORCED_HOSTING_MODE while preserving WEBVIEW2_USER_DATA_FOLDER",
+                string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"))
+                && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"))
+                && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER"))
+                && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER"))
+                && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("COREWEBVIEW2_FORCED_HOSTING_MODE"))
+                && string.Equals(Environment.GetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER"), @"C:\KeepSentinelUserData", StringComparison.Ordinal));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", prevWvArgs);
+            Environment.SetEnvironmentVariable("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", prevWvFolder);
+            Environment.SetEnvironmentVariable("WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER", prevWvPipe);
+            Environment.SetEnvironmentVariable("WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER", prevWvWait);
+            Environment.SetEnvironmentVariable("COREWEBVIEW2_FORCED_HOSTING_MODE", prevForcedHost);
+            Environment.SetEnvironmentVariable("WEBVIEW2_USER_DATA_FOLDER", prevWvUserData);
+        }
+    }
+
+    // =====================================================================
     // Sandbox Helpers & Test Doubles
     // =====================================================================
     private static Evidence DecideFile(string fullPath)
@@ -2187,6 +2703,127 @@ public static class SelfTest
             bw.Write((ushort)1);
             bw.Write(cdSize);
             bw.Write(cdOffset);
+            bw.Write((ushort)0);
+        }
+    }
+
+    private static void WriteMultiEntryZip(string path, string[] entryNames, byte[][] contents)
+    {
+        int count = entryNames.Length;
+        byte[][] nameBytesList = new byte[count][];
+        uint[] localOffsets = new uint[count];
+        using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (BinaryWriter bw = new BinaryWriter(fs))
+        {
+            for (int i = 0; i < count; i++)
+            {
+                nameBytesList[i] = Encoding.ASCII.GetBytes(entryNames[i]);
+                byte[] content = contents[i];
+                localOffsets[i] = (uint)fs.Position;
+                bw.Write((uint)0x04034b50);
+                bw.Write((ushort)20);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((uint)0);
+                bw.Write((uint)content.Length);
+                bw.Write((uint)content.Length);
+                bw.Write((ushort)nameBytesList[i].Length);
+                bw.Write((ushort)0);
+                bw.Write(nameBytesList[i]);
+                bw.Write(content);
+            }
+
+            uint cdOffset = (uint)fs.Position;
+            for (int i = 0; i < count; i++)
+            {
+                byte[] nameBytes = nameBytesList[i];
+                byte[] content = contents[i];
+                bw.Write((uint)0x02014b50);
+                bw.Write((ushort)20);
+                bw.Write((ushort)20);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((uint)0);
+                bw.Write((uint)content.Length);
+                bw.Write((uint)content.Length);
+                bw.Write((ushort)nameBytes.Length);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((uint)0);
+                bw.Write(localOffsets[i]);
+                bw.Write(nameBytes);
+            }
+            uint cdSize = (uint)fs.Position - cdOffset;
+
+            bw.Write((uint)0x06054b50);
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)count);
+            bw.Write((ushort)count);
+            bw.Write(cdSize);
+            bw.Write(cdOffset);
+            bw.Write((ushort)0);
+        }
+    }
+
+    private static void WriteCraftedEocdZip(string path, string entryName, byte[] content, ushort eocdEntries, bool zip64Sentinels, bool omitCd)
+    {
+        byte[] nameBytes = Encoding.ASCII.GetBytes(entryName);
+        using (FileStream fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (BinaryWriter bw = new BinaryWriter(fs))
+        {
+            bw.Write((uint)0x04034b50);
+            bw.Write((ushort)20);
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write((uint)0);
+            bw.Write((uint)content.Length);
+            bw.Write((uint)content.Length);
+            bw.Write((ushort)nameBytes.Length);
+            bw.Write((ushort)0);
+            bw.Write(nameBytes);
+            bw.Write(content);
+
+            uint cdOffset = (uint)fs.Position;
+            uint cdSize = 0;
+            if (!omitCd)
+            {
+                bw.Write((uint)0x02014b50);
+                bw.Write((ushort)20);
+                bw.Write((ushort)20);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((uint)0);
+                bw.Write((uint)content.Length);
+                bw.Write((uint)content.Length);
+                bw.Write((ushort)nameBytes.Length);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((ushort)0);
+                bw.Write((uint)0);
+                bw.Write((uint)0);
+                bw.Write(nameBytes);
+                cdSize = (uint)fs.Position - cdOffset;
+            }
+
+            bw.Write((uint)0x06054b50);
+            bw.Write((ushort)0);
+            bw.Write((ushort)0);
+            bw.Write(zip64Sentinels ? (ushort)0xFFFF : eocdEntries);
+            bw.Write(zip64Sentinels ? (ushort)0xFFFF : eocdEntries);
+            bw.Write(zip64Sentinels ? 0xFFFFFFFFu : cdSize);
+            bw.Write(zip64Sentinels ? 0xFFFFFFFFu : cdOffset);
             bw.Write((ushort)0);
         }
     }

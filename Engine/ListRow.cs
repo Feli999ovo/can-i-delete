@@ -218,6 +218,7 @@ public static class RowClass
     /// <summary>该行是否属于某一筛选档。</summary>
     public static bool Matches(ListRow r, RowFilter f)
     {
+        if (r == null) return false;
         switch (f)
         {
             case RowFilter.Candidate: return r.PolicyEligible;
@@ -230,6 +231,7 @@ public static class RowClass
     /// <summary>该行落在哪一档（四档互斥且覆盖全部行）。</summary>
     public static RowFilter Of(ListRow r)
     {
+        if (r == null) return RowFilter.Review;
         if (r.PolicyEligible) return RowFilter.Candidate;
         return r.Risk == "保留" ? RowFilter.Keep : RowFilter.Review;
     }

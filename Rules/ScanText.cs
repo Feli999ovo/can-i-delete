@@ -246,6 +246,7 @@ public static class ScanText
             case "KEEP-SYSTEM": name = "系统目录"; break;
             case "KEEP-LOCK": name = "锁定文件"; break;
             case "KEEP-MSICACHE": name = "Windows Installer 维护缓存"; break;
+            case "KEEP-CHATDB": name = "微信 / QQ 聊天记录数据库"; break;
             case "USER-DOC": name = "用户文档或压缩包"; break;
             case "USER-CONFIG": name = "用户配置或数据文件"; break;
             case "USER-SCRIPT": name = "可执行脚本或程序"; break;

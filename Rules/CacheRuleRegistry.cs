@@ -81,6 +81,11 @@ public static class CacheRuleRegistry
     private static int cachedExistingGeneration = 1;
     private static int refreshEpoch = 1;
 
+    internal static int CurrentRefreshEpoch
+    {
+        get { lock (rootsCacheGate) { return refreshEpoch; } }
+    }
+
     private static readonly object elevationGate = new object();
     private static bool elevationChecked;
     private static bool isElevatedCached;
@@ -120,11 +125,11 @@ public static class CacheRuleRegistry
             if (winDir.Length == 0) return false;
 
             string sdDownload = Path.Combine(Path.Combine(winDir, "SoftwareDistribution"), "Download");
-            if (Directory.Exists(sdDownload) && !PathGuard.IsReparsePoint(sdDownload))
+            if (Directory.Exists(sdDownload) && !PathGuard.HasAnyReparseComponent(sdDownload))
                 return true;
 
             string winTemp = Path.Combine(winDir, "Temp");
-            if (Directory.Exists(winTemp) && !PathGuard.IsReparsePoint(winTemp))
+            if (Directory.Exists(winTemp) && !PathGuard.HasAnyReparseComponent(winTemp))
                 return true;
 
             return false;
@@ -211,33 +216,62 @@ public static class CacheRuleRegistry
 
     internal static CacheRoots.Root[] DiscoverExistingRootsCached(out int generation)
     {
-        long nowTicks = DateTime.UtcNow.Ticks;
-        int epochSnapshot;
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            long nowTicks = DateTime.UtcNow.Ticks;
+            int epochSnapshot;
+            lock (rootsCacheGate)
+            {
+                if (cachedExistingRoots != null
+                    && nowTicks >= cachedExistingAtUtcTicks
+                    && (nowTicks - cachedExistingAtUtcTicks) < ExistingRootsTtlTicks)
+                {
+                    generation = cachedExistingGeneration;
+                    return cachedExistingRoots;
+                }
+                epochSnapshot = refreshEpoch;
+            }
+
+            CacheRoots.Root[] probed = ProbeExistingRootsFromDisk();
+
+            lock (rootsCacheGate)
+            {
+                if (refreshEpoch == epochSnapshot)
+                {
+                    cachedExistingRoots = probed;
+                    cachedExistingAtUtcTicks = DateTime.UtcNow.Ticks;
+                    cachedExistingGeneration++;
+                    generation = cachedExistingGeneration;
+                    return cachedExistingRoots;
+                }
+                if (cachedExistingRoots != null)
+                {
+                    generation = cachedExistingGeneration;
+                    return cachedExistingRoots;
+                }
+            }
+        }
+
+        int fallbackEpoch;
         lock (rootsCacheGate)
         {
-            if (cachedExistingRoots != null
-                && nowTicks >= cachedExistingAtUtcTicks
-                && (nowTicks - cachedExistingAtUtcTicks) < ExistingRootsTtlTicks)
+            fallbackEpoch = refreshEpoch;
+        }
+
+        CacheRoots.Root[] fresh = ProbeExistingRootsFromDisk();
+        lock (rootsCacheGate)
+        {
+            if (refreshEpoch == fallbackEpoch)
             {
+                cachedExistingRoots = fresh;
+                cachedExistingAtUtcTicks = DateTime.UtcNow.Ticks;
+                cachedExistingGeneration++;
                 generation = cachedExistingGeneration;
                 return cachedExistingRoots;
             }
-            epochSnapshot = refreshEpoch;
+            generation = 0;
         }
-
-        CacheRoots.Root[] probed = ProbeExistingRootsFromDisk();
-
-        lock (rootsCacheGate)
-        {
-            if (refreshEpoch == epochSnapshot || cachedExistingRoots == null)
-            {
-                cachedExistingRoots = probed;
-                cachedExistingAtUtcTicks = DateTime.UtcNow.Ticks;
-                cachedExistingGeneration++;
-            }
-            generation = cachedExistingGeneration;
-            return cachedExistingRoots;
-        }
+        return fresh;
     }
 
     private static CacheRoots.Root[] ProbeExistingRootsFromDisk()
@@ -300,7 +334,7 @@ public static class CacheRuleRegistry
             try
             {
                 if (!Directory.Exists(canon)) continue;
-                if (PathGuard.IsReparsePoint(canon)) continue;
+                if (PathGuard.HasAnyReparseComponent(canon)) continue;
             }
             catch { continue; }
 
@@ -515,7 +549,7 @@ public static class CacheRuleRegistry
                     new RuleMatchPattern
                     {
                         Stage = RuleMatchStage.StandardCache,
-                        Pattern = @"[\\/](microsoft[\\/]edge|edge[\\/]user data|google[\\/]chrome|chrome[\\/]user data|bravesoftware|brave-browser|brave[\\/]user data|vivaldi|opera software|opera stable|opera gx)[\\/].*[\\/](cache[\\/]cache_data|code cache|gpucache|dawncache)[\\/].+$",
+                        Pattern = @"[\\/](microsoft[\\/]edge|edge[\\/]user data|google[\\/]chrome|chrome[\\/]user data|bravesoftware|brave-browser|brave[\\/]user data|vivaldi|opera software|opera stable|opera gx)[\\/](?:[^\\/]+[\\/]){0,4}(cache[\\/]cache_data|code cache|gpucache|dawncache)[\\/].+$",
                         NameOnly = false,
                         App = "浏览器（Edge / Chrome / Brave / Vivaldi / Opera）",
                         Reason = "浏览器网页或渲染缓存项（Chromium 缓存魔数与结构校验通过）",
@@ -578,7 +612,7 @@ public static class CacheRuleRegistry
                     new RuleMatchPattern
                     {
                         Stage = RuleMatchStage.BeforeUserConfig,
-                        Pattern = @"[\\/](sns[\\/]cache|cache[\\/]sns)[\\/](?!.*\.(?:lock|db|sqlite|exe|dll|sys|ini|cfg|config)$).+$",
+                        Pattern = @"[\\/](sns[\\/]cache|cache[\\/]sns)[\\/](?!.*\.(?:lock|lck|lockfile|db|db-wal|db-shm|db-journal|sqlite|sqlite-wal|sqlite-shm|exe|dll|sys|ini|cfg|config|key|pem|pfx|p12|cer|crt|env|kdbx)$).+$",
                         NameOnly = false,
                         App = "微信或企业微信（朋友圈缓存）",
                         Reason = "朋友圈图片或视频预览缓存（纯缓存子目录与媒体/二进制帧结构校验通过）",
@@ -590,7 +624,7 @@ public static class CacheRuleRegistry
                     new RuleMatchPattern
                     {
                         Stage = RuleMatchStage.BeforeUserConfig,
-                        Pattern = @"[\\/](applet|wmpfruntime|xplugin|xweb|radium[\\/]web[\\/]cache|cefcache|webkit_cache|nt_qq[\\/]global[\\/]nt_temp|nt_temp)[\\/](?!.*\.(?:lock|db|sqlite|exe|dll|sys|ini|cfg|config)$).+$",
+                        Pattern = @"[\\/](applet|wmpfruntime|xplugin|xweb|radium[\\/]web[\\/]cache|cefcache|webkit_cache|nt_qq[\\/]global[\\/]nt_temp|nt_temp)[\\/](?!.*\.(?:lock|lck|lockfile|db|db-wal|db-shm|db-journal|sqlite|sqlite-wal|sqlite-shm|exe|dll|sys|ini|cfg|config|key|pem|pfx|p12|cer|crt|env|kdbx)$).+$",
                         NameOnly = false,
                         App = "微信 / 企业微信 / QQ（小程序与内置网页缓存）",
                         Reason = "聊天软件小程序运行包或内置网页缓存（纯缓存子目录与安全头结构校验通过）",
@@ -900,7 +934,7 @@ public static class CacheRuleRegistry
                     {
                         Stage = RuleMatchStage.BeforeUserDoc,
                         MinAgeHours = 48,
-                        Pattern = @"[\\/]softwaredistribution[\\/]download[\\/](?!.*(?:^|[\\/])datastore(?:[\\/]|$))(?!.*\.lock$).+$",
+                        Pattern = @"[\\/]softwaredistribution[\\/]download[\\/](?!.*(?:^|[\\/])datastore(?:[\\/]|$))(?!.*\.(?:lock|lck|lockfile|edb|docx|doc|xlsx|xls|pptx|ppt|pdf|psd|rtf|pfx|p12|cer|crt|key|pem|kdbx|jpg|jpeg|png|gif|bmp|webp|heic|mp4|mov|avi|mkv|sqlite|sqlite3|sqlite-wal|sqlite-shm|db|db-wal|db-shm|db-journal)$).+$",
                         NameOnly = false,
                         App = "Windows Update 服务",
                         Reason = "Windows Update 下载缓存包（满 48 小时且通过更新包或清单头校验）",
@@ -999,7 +1033,7 @@ public static class CacheRuleRegistry
             if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
             string canon = PathGuard.Canonical(dir);
             if (canon.Length == 0 || !Directory.Exists(canon)) return;
-            if (PathGuard.IsReparsePoint(canon)) return;
+            if (PathGuard.HasAnyReparseComponent(canon)) return;
             if (!string.IsNullOrEmpty(baseAnchor) && PathGuard.IsInside(baseAnchor, canon)
                 && PathGuard.HasReparseAncestor(baseAnchor, canon))
                 return;
@@ -1023,7 +1057,7 @@ public static class CacheRuleRegistry
             if (canon.Length == 0) return false;
             if (seenDirs != null && !seenDirs.Add(canon)) return false;
             if (!Directory.Exists(canon)) return false;
-            if (PathGuard.IsReparsePoint(canon)) return false;
+            if (PathGuard.HasAnyReparseComponent(canon)) return false;
             if (!string.IsNullOrEmpty(baseAnchor) && PathGuard.IsInside(baseAnchor, canon)
                 && PathGuard.HasReparseAncestor(baseAnchor, canon))
                 return false;
@@ -1105,7 +1139,7 @@ public static class CacheRuleRegistry
             if (!Directory.Exists(userDataDir)) return;
             string canonUser = PathGuard.Canonical(userDataDir);
             if (canonUser.Length == 0 || !Directory.Exists(canonUser)) return;
-            if (PathGuard.IsReparsePoint(canonUser)) return;
+            if (PathGuard.HasAnyReparseComponent(canonUser)) return;
             if (localAnchor.Length > 0 && PathGuard.IsInside(localAnchor, canonUser)
                 && PathGuard.HasReparseAncestor(localAnchor, canonUser))
                 return;
@@ -1166,7 +1200,7 @@ public static class CacheRuleRegistry
             if (!Directory.Exists(operaDir)) return;
             string canonOpera = PathGuard.Canonical(operaDir);
             if (canonOpera.Length == 0 || !Directory.Exists(canonOpera)) return;
-            if (PathGuard.IsReparsePoint(canonOpera)) return;
+            if (PathGuard.HasAnyReparseComponent(canonOpera)) return;
             if (anchor.Length > 0 && PathGuard.IsInside(anchor, canonOpera)
                 && PathGuard.HasReparseAncestor(anchor, canonOpera))
                 return;
@@ -1193,7 +1227,7 @@ public static class CacheRuleRegistry
             if (!Directory.Exists(profilesDir)) return;
             string canonProfiles = PathGuard.Canonical(profilesDir);
             if (canonProfiles.Length == 0 || !Directory.Exists(canonProfiles)) return;
-            if (PathGuard.IsReparsePoint(canonProfiles)) return;
+            if (PathGuard.HasAnyReparseComponent(canonProfiles)) return;
             if (localAnchor.Length > 0 && PathGuard.IsInside(localAnchor, canonProfiles)
                 && PathGuard.HasReparseAncestor(localAnchor, canonProfiles))
                 return;
@@ -1269,16 +1303,16 @@ public static class CacheRuleRegistry
         catch { }
 
         // 1) %APPDATA%（含 VS Code / Cursor CachedData & CachedExtensionVsiXs 及各桌面软件纯缓存四件套）
-        if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.IsReparsePoint(roaming))
+        if (roaming.Length > 0 && Directory.Exists(roaming) && !PathGuard.HasAnyReparseComponent(roaming))
         {
             ProbeBoundedAppDataBase(list, seen, roaming, true, selfDataDir, selfWebViewDir);
         }
 
         // 2) %LOCALAPPDATA%（含 Steam htmlcache 及 Electron / CEF / WebView2 宿主纯缓存四件套）
-        if (local.Length > 0 && Directory.Exists(local) && !PathGuard.IsReparsePoint(local))
+        if (local.Length > 0 && Directory.Exists(local) && !PathGuard.HasAnyReparseComponent(local))
         {
             string steamHtml = Path.Combine(local, "Steam", "htmlcache");
-            if (Directory.Exists(steamHtml) && !PathGuard.IsReparsePoint(steamHtml))
+            if (Directory.Exists(steamHtml) && !PathGuard.HasAnyReparseComponent(steamHtml))
             {
                 AddPureChromiumQuad(list, seen, local, "TMP-APPCACHE", steamHtml, "Steam 内置网页");
             }
@@ -1309,6 +1343,7 @@ public static class CacheRuleRegistry
                 return;
             string canon = PathGuard.CanonicalFast(dirInfo.FullName);
             if (canon.Length == 0) return;
+            if (PathGuard.HasAnyReparseComponent(canon)) return;
             if (seen != null && !seen.Add(canon)) return;
             list.Add(new CacheRoots.Root { RuleId = ruleId, Directory = canon, Why = why });
         }
@@ -1453,7 +1488,7 @@ public static class CacheRuleRegistry
                 looksLikeSingleApp = true;
                 if (!IsExcludedSelfOrProtectedAppRoot(ch.FullName, n, selfDataDir, selfWebViewDir))
                 {
-                    if (InspectEbWebViewDir(list, seen, ch, appLabel))
+                    if (InspectEbWebViewDir(list, seen, ch, appLabel, selfDataDir, selfWebViewDir))
                         found = true;
                 }
             }
@@ -1511,7 +1546,9 @@ public static class CacheRuleRegistry
         List<CacheRoots.Root> list,
         HashSet<string> seen,
         DirectoryInfo ebWebViewDir,
-        string appLabel)
+        string appLabel,
+        string selfDataDir,
+        string selfWebViewDir)
     {
         bool found = false;
         try
@@ -1523,12 +1560,13 @@ public static class CacheRuleRegistry
                 DirectoryInfo wp = profiles[i];
                 if ((wp.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                 if (!IsBrowserProfileName(wp.Name)) continue;
+                if (IsExcludedSelfOrProtectedAppRoot(wp.FullName, wp.Name, selfDataDir, selfWebViewDir)) continue;
 
                 DirectoryInfo[] wpChildren;
                 try { wpChildren = wp.GetDirectories(); }
                 catch { continue; }
                 bool dummy;
-                if (InspectAppDirChildren(list, seen, appLabel + " WebView2", wpChildren, false, "", "", out dummy))
+                if (InspectAppDirChildren(list, seen, appLabel + " WebView2", wpChildren, false, selfDataDir, selfWebViewDir, out dummy))
                     found = true;
             }
         }
@@ -1540,9 +1578,11 @@ public static class CacheRuleRegistry
     {
         if (string.IsNullOrEmpty(name)) return true;
         if (name[0] == '.' || name[0] == '{') return true;
-        switch (name.ToLowerInvariant())
+        string lower = name.ToLowerInvariant();
+        if (lower.StartsWith("keepass", StringComparison.Ordinal)) return true;
+        switch (lower)
         {
-            // 浏览器厂商与已由其他规则接管的顶层目录、系统特殊目录、安装包目录
+            // 浏览器厂商与已由其他规则接管的顶层目录、系统特殊目录、聊天软件、密码库/钱包及安装包目录
             case "temp":
             case "tmp":
             case "packages":
@@ -1572,6 +1612,16 @@ public static class CacheRuleRegistry
             case "nvidia corporation":
             case "amd":
             case "intel":
+            case "tencent":
+            case "wechat":
+            case "wxwork":
+            case "qq":
+            case "1password":
+            case "bitwarden":
+            case "keepass":
+            case "gnupg":
+            case "ledger live":
+            case "exodus":
             case "canidelete":
             case "can-i-delete":
             case "anping":

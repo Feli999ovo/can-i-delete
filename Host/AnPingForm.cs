@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -15,6 +16,7 @@ public class AnPingForm : Form
     private AnPingBridge bridge;
     private Icon ownedFormIcon;
     private bool isFormClosingInProgress;
+    private long lastActivateTicks;
     private readonly Timer preferencesTimer = new Timer { Interval = 500 };
     private bool? lastMotion, lastContrast;
 
@@ -157,6 +159,22 @@ public class AnPingForm : Form
             (int)Math.Round(520 * dpiScale));
     }
 
+    private static bool IsAllowedAppUri(string rawUri, bool mainDocOnly)
+    {
+        if (string.IsNullOrEmpty(rawUri)) return false;
+        Uri uri;
+        if (!Uri.TryCreate(rawUri, UriKind.Absolute, out uri) || uri == null) return false;
+        if (!string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!string.Equals(uri.Host, "anping.local", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!uri.IsDefaultPort) return false;
+        if (!string.IsNullOrEmpty(uri.UserInfo)) return false;
+        if (mainDocOnly)
+        {
+            return string.Equals(uri.AbsolutePath, "/index.html", StringComparison.OrdinalIgnoreCase);
+        }
+        return true;
+    }
+
     private async void InitWebViewAsync()
     {
         try { AppDataPaths.Prepare(); }
@@ -172,6 +190,8 @@ public class AnPingForm : Form
         }
         try
         {
+            Program.ClearSensitiveWebView2EnvironmentOverrides();
+
             string ver = null;
             try
             {
@@ -189,7 +209,7 @@ public class AnPingForm : Form
 
             string userDataDir = AppDataPaths.WebView;
             var options = new CoreWebView2EnvironmentOptions();
-            options.AdditionalBrowserArguments = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") ?? "";
+            options.AdditionalBrowserArguments = "";
             int maxInitAttempts = !string.IsNullOrEmpty(Program.StartupAutoAction) ? 6 : 1;
             for (int attempt = 1; ; attempt++)
             {
@@ -206,36 +226,78 @@ public class AnPingForm : Form
                 await System.Threading.Tasks.Task.Delay(220);
             }
 
-            string uiDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ui");
-            if (!Directory.Exists(uiDir))
-            {
-                uiDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "ui"));
-            }
-
-            if (!Directory.Exists(uiDir))
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string uiDir = Path.Combine(baseDir, "ui");
+            string indexFile = Path.Combine(uiDir, "index.html");
+            if (string.IsNullOrEmpty(baseDir)
+                || !PathGuard.IsLocalDrivePath(baseDir)
+                || PathGuard.HasAnyReparseComponent(baseDir)
+                || !Directory.Exists(uiDir)
+                || PathGuard.HasAnyReparseComponent(uiDir)
+                || !File.Exists(indexFile)
+                || PathGuard.HasAnyReparseComponent(indexFile))
             {
                 MessageBox.Show(this,
-                    "未找到 UI 界面资源目录：\n" + uiDir +
-                    "\n\n请确保 ui 文件夹与 can-i-delete.exe 位于同一目录。\n\n" + ZipExtractHint,
+                    "未找到有效的 UI 界面资源目录：\n" + uiDir +
+                    "\n\n请确保 ui 文件夹与 can-i-delete.exe 位于同一目录且不是符号链接。\n\n" + ZipExtractHint,
                     "按平 · 资源缺失", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Close();
                 return;
             }
 
             webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                "anping.local", uiDir, CoreWebView2HostResourceAccessKind.Allow);
+                "anping.local", uiDir, CoreWebView2HostResourceAccessKind.Deny);
 
-            webView.CoreWebView2.Settings.IsWebMessageEnabled = true;
-            webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
-            webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-            webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
-            webView.CoreWebView2.Settings.IsZoomControlEnabled = false;
+            CoreWebView2Settings st = webView.CoreWebView2.Settings;
+            st.IsWebMessageEnabled = true;
+            st.AreDevToolsEnabled = false;
+            st.AreDefaultContextMenusEnabled = false;
+            st.AreDefaultScriptDialogsEnabled = false;
+            st.AreHostObjectsAllowed = false;
+            st.AreBrowserAcceleratorKeysEnabled = false;
+            st.IsStatusBarEnabled = false;
+            st.IsZoomControlEnabled = false;
+            st.IsPinchZoomEnabled = false;
+            st.IsSwipeNavigationEnabled = false;
+            st.IsBuiltInErrorPageEnabled = false;
+            st.IsGeneralAutofillEnabled = false;
+            st.IsPasswordAutosaveEnabled = false;
 
             webView.CoreWebView2.NavigationStarting += delegate(object s, CoreWebView2NavigationStartingEventArgs e)
             {
-                if (!e.Uri.StartsWith("https://anping.local/", StringComparison.OrdinalIgnoreCase))
+                if (!IsAllowedAppUri(e.Uri, true))
                 {
                     e.Cancel = true;
+                }
+            };
+
+            webView.CoreWebView2.FrameNavigationStarting += delegate(object s, CoreWebView2NavigationStartingEventArgs e)
+            {
+                e.Cancel = true;
+            };
+
+            webView.CoreWebView2.NewWindowRequested += delegate(object s, CoreWebView2NewWindowRequestedEventArgs e)
+            {
+                e.Handled = true;
+            };
+
+            webView.CoreWebView2.PermissionRequested += delegate(object s, CoreWebView2PermissionRequestedEventArgs e)
+            {
+                e.State = CoreWebView2PermissionState.Deny;
+            };
+
+            webView.CoreWebView2.DownloadStarting += delegate(object s, CoreWebView2DownloadStartingEventArgs e)
+            {
+                e.Cancel = true;
+            };
+
+            webView.CoreWebView2.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All);
+            webView.CoreWebView2.WebResourceRequested += delegate(object s, CoreWebView2WebResourceRequestedEventArgs e)
+            {
+                string reqUri = e.Request != null ? e.Request.Uri : "";
+                if (!IsAllowedAppUri(reqUri, false) && !reqUri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                {
+                    e.Response = webView.CoreWebView2.Environment.CreateWebResourceResponse(null, 403, "Forbidden", "");
                 }
             };
 
@@ -243,6 +305,7 @@ public class AnPingForm : Form
             {
                 try
                 {
+                    if (!IsAllowedAppUri(e.Source, false)) return;
                     string raw = e.TryGetWebMessageAsString();
                     if (string.IsNullOrEmpty(raw))
                     {
@@ -255,7 +318,7 @@ public class AnPingForm : Form
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine("[CoreWebView2 Message Error] " + ex.Message);
+                    Console.WriteLine("[CoreWebView2 Message Error] " + ex.GetType().Name);
                 }
             };
 
@@ -355,7 +418,7 @@ public class AnPingForm : Form
 
     public void PublishSystemPreferences()
     {
-        if (IsDisposed || webView.IsDisposed || webView.CoreWebView2 == null) return;
+        if (IsDisposed || webView == null || webView.IsDisposed || webView.CoreWebView2 == null) return;
         bool animation;
         bool known = SystemParametersInfo(0x1042, 0, out animation, 0);
         lastMotion = known && !animation;
@@ -399,7 +462,7 @@ public class AnPingForm : Form
         {
             base.OnFormClosing(e);
             if (e.Cancel) return;
-            if (bridge != null && bridge.IsBusyWithFileOp)
+            if (bridge != null)
             {
                 bridge.StopFileOpGracefully(1500);
             }
@@ -418,20 +481,26 @@ public class AnPingForm : Form
         uint activateMsg = Program.ActivateWindowMessageId;
         if (activateMsg != 0 && (uint)m.Msg == activateMsg)
         {
-            if (this.WindowState == FormWindowState.Minimized || (this.IsHandleCreated && IsIconic(this.Handle)))
+            long nowTicks = Stopwatch.GetTimestamp();
+            long minIntervalTicks = Math.Max(1L, Stopwatch.Frequency / 2L);
+            if (lastActivateTicks == 0L || (nowTicks - lastActivateTicks) >= minIntervalTicks)
             {
+                lastActivateTicks = nowTicks;
+                if (this.WindowState == FormWindowState.Minimized || (this.IsHandleCreated && IsIconic(this.Handle)))
+                {
+                    if (this.IsHandleCreated)
+                    {
+                        ShowWindow(this.Handle, SW_RESTORE);
+                    }
+                    this.WindowState = FormWindowState.Normal;
+                }
+                this.Show();
+                this.Activate();
+                this.BringToFront();
                 if (this.IsHandleCreated)
                 {
-                    ShowWindow(this.Handle, SW_RESTORE);
+                    SetForegroundWindow(this.Handle);
                 }
-                this.WindowState = FormWindowState.Normal;
-            }
-            this.Show();
-            this.Activate();
-            this.BringToFront();
-            if (this.IsHandleCreated)
-            {
-                SetForegroundWindow(this.Handle);
             }
             m.Result = IntPtr.Zero;
             return;
@@ -454,15 +523,21 @@ public class AnPingForm : Form
 
         if (m.Msg == 0x02E0 && m.LParam != IntPtr.Zero)
         {
-            int dpi = m.WParam.ToInt32() & 0xffff;
-            MinimumSize = GetScaledMinimumSize(dpi / 96.0);
+            int dpi = (int)(m.WParam.ToInt64() & 0xFFFFL);
+            if (dpi > 0)
+            {
+                MinimumSize = GetScaledMinimumSize(dpi / 96.0);
+            }
             var rect = (DpiRect)Marshal.PtrToStructure(m.LParam, typeof(DpiRect));
             Bounds = Rectangle.FromLTRB(rect.Left, rect.Top, rect.Right, rect.Bottom);
         }
 
-        if (m.Msg == WM_NCHITTEST && (int)m.Result == HTCLIENT)
+        if (m.Msg == WM_NCHITTEST && m.Result == (IntPtr)HTCLIENT)
         {
-            Point p = PointToClient(new Point(m.LParam.ToInt32()));
+            long lp = m.LParam.ToInt64();
+            int x = (short)(lp & 0xFFFFL);
+            int y = (short)((lp >> 16) & 0xFFFFL);
+            Point p = PointToClient(new Point(x, y));
             int b;
             using (Graphics g = CreateGraphics()) b = Math.Max(6, (int)(6 * g.DpiX / 96));
             bool left = p.X <= b;

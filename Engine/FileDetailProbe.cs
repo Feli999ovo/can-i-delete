@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 /// <summary>单文件技术详情快照（按需只读探测，供文件详情抽屉展示）。</summary>
 public sealed class FileTechInfo
@@ -17,7 +18,7 @@ public sealed class FileTechInfo
 
 /// <summary>
 /// 按需读取单个文件的真实创建时间、最后访问时间、属性组合及占用进程。
-/// 全程只读：使用 FileInfo 读取元数据，使用 Windows Restart Manager 查询占用进程，绝不修改目标文件。
+/// 全程只读：拒绝 UNC / 非本地路径与重解析点跟随，限流 Windows Restart Manager 并发并校验进程启动时间。
 /// </summary>
 public static class FileDetailProbe
 {
@@ -25,6 +26,10 @@ public static class FileDetailProbe
     private const int ERROR_MORE_DATA = 234;
     private const int CCH_RM_MAX_APP_NAME = 255;
     private const int CCH_RM_MAX_SVC_NAME = 63;
+    private const uint MaxRmProcInfos = 1024u;
+    private const long StartTimeToleranceTicks = 10000000L; // 1 秒容差
+
+    private static readonly SemaphoreSlim RmGate = new SemaphoreSlim(4, 4);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RM_UNIQUE_PROCESS
@@ -85,10 +90,28 @@ public static class FileDetailProbe
             return info;
         }
 
-        string fullPath;
+        string fullPath = PathGuard.Canonical(path);
+        if (fullPath.Length == 0 || !PathGuard.IsLocalDrivePath(fullPath))
+        {
+            info.Created = "无法读取";
+            info.Accessed = "无法读取";
+            info.Attributes = "无法读取";
+            info.Process = "无法读取";
+            return info;
+        }
+
+        FileAttributes directAttr;
         try
         {
-            fullPath = Path.GetFullPath(path);
+            directAttr = File.GetAttributes(fullPath);
+            if ((int)directAttr == -1 || (directAttr & FileAttributes.Directory) != 0)
+            {
+                info.Created = "无法读取";
+                info.Accessed = "无法读取";
+                info.Attributes = "无法读取";
+                info.Process = "无法读取";
+                return info;
+            }
         }
         catch
         {
@@ -96,6 +119,15 @@ public static class FileDetailProbe
             info.Accessed = "无法读取";
             info.Attributes = "无法读取";
             info.Process = "无法读取";
+            return info;
+        }
+
+        if ((directAttr & FileAttributes.ReparsePoint) != 0 || PathGuard.HasAnyReparseComponent(fullPath))
+        {
+            info.Created = "无法读取";
+            info.Accessed = "无法读取";
+            info.Attributes = FormatAttributes(directAttr);
+            info.Process = "未探测（重解析点）";
             return info;
         }
 
@@ -154,6 +186,11 @@ public static class FileDetailProbe
             else
             {
                 info.Attributes = FormatAttributes(attr);
+                if ((attr & FileAttributes.ReparsePoint) != 0)
+                {
+                    info.Process = "未探测（重解析点）";
+                    return info;
+                }
             }
         }
         catch
@@ -185,8 +222,12 @@ public static class FileDetailProbe
     {
         uint sessionHandle = 0;
         bool sessionStarted = false;
+        bool entered = false;
         try
         {
+            entered = RmGate.Wait(1500);
+            if (!entered) return "无法读取";
+
             StringBuilder key = new StringBuilder(64);
             int startRc = RmStartSession(out sessionHandle, 0, key);
             if (startRc != ERROR_SUCCESS) return "无法读取";
@@ -201,11 +242,14 @@ public static class FileDetailProbe
             uint rebootReasons = 0;
             int listRc = RmGetList(sessionHandle, out needed, ref count, null, ref rebootReasons);
             if (listRc == ERROR_SUCCESS && needed == 0) return "未占用";
+            if (needed > MaxRmProcInfos) return "无法读取";
 
             RM_PROCESS_INFO[] procInfos = null;
             for (int attempt = 0; attempt < 3 && listRc == ERROR_MORE_DATA; attempt++)
             {
+                if (needed > MaxRmProcInfos) return "无法读取";
                 count = needed + 4u;
+                if (count > MaxRmProcInfos + 4u) count = MaxRmProcInfos + 4u;
                 procInfos = new RM_PROCESS_INFO[count];
                 listRc = RmGetList(sessionHandle, out needed, ref count, procInfos, ref rebootReasons);
                 if (listRc == ERROR_SUCCESS) break;
@@ -238,17 +282,32 @@ public static class FileDetailProbe
             {
                 try { RmEndSession(sessionHandle); } catch { }
             }
+            if (entered)
+            {
+                try { RmGate.Release(); } catch { }
+            }
         }
     }
 
     private static string FormatProcessEntry(int pid, RM_PROCESS_INFO info)
     {
+        long rmStart = (((long)info.Process.ProcessStartTime.dwHighDateTime) << 32)
+                     | (uint)info.Process.ProcessStartTime.dwLowDateTime;
         string name = "";
         try
         {
             using (Process p = Process.GetProcessById(pid))
             {
-                if (!string.IsNullOrEmpty(p.ProcessName))
+                bool startMatches = true;
+                if (rmStart > 0)
+                {
+                    long procStart = p.StartTime.ToFileTimeUtc();
+                    if (Math.Abs(procStart - rmStart) > StartTimeToleranceTicks)
+                    {
+                        startMatches = false;
+                    }
+                }
+                if (startMatches && !string.IsNullOrEmpty(p.ProcessName))
                 {
                     name = p.ProcessName.Trim();
                     if (name.Length > 0 && !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
