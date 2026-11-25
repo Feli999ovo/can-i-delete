@@ -1895,8 +1895,8 @@ public static class SelfTest
             System.Reflection.Assembly selfAsm = typeof(Program).Assembly;
             object[] infoAttrs = selfAsm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
             string infoVer = infoAttrs.Length > 0 ? ((System.Reflection.AssemblyInformationalVersionAttribute)infoAttrs[0]).InformationalVersion : "";
-            Check("D34: Assembly version is 1.0.0.0 / v1.0.0",
-                selfAsm.GetName().Version.ToString() == "1.0.0.0" && infoVer == "v1.0.0");
+            Check("D34: Assembly version is 1.0.1.0 / v1.0.1",
+                selfAsm.GetName().Version.ToString() == "1.0.1.0" && infoVer == "v1.0.1");
 
             ChatStorageLocator.ClearMockChatRootsForTest();
         }
@@ -2062,12 +2062,12 @@ public static class SelfTest
         if (File.Exists(exePath))
         {
             FileVersionInfo fvi = FileVersionInfo.GetVersionInfo(exePath);
-            Check("E3b: PE FileVersion == 1.0.0.0, ProductName == 按平, ProductVersion contains 1.0.0",
+            Check("E3b: PE FileVersion == 1.0.1.0, ProductName == 按平, ProductVersion contains 1.0.1",
                 fvi != null
-                && fvi.FileVersion == "1.0.0.0"
+                && fvi.FileVersion == "1.0.1.0"
                 && fvi.ProductName == "按平"
                 && fvi.ProductVersion != null
-                && fvi.ProductVersion.IndexOf("1.0.0", StringComparison.Ordinal) >= 0);
+                && fvi.ProductVersion.IndexOf("1.0.1", StringComparison.Ordinal) >= 0);
 
             using (Icon assocIcon = Icon.ExtractAssociatedIcon(exePath))
             {

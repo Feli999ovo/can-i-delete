@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" name="can-i-delete" type="win32" />
+  <assemblyIdentity version="1.0.1.0" name="can-i-delete" type="win32" />
   <description>按平 (can-i-delete)</description>
 
   <!-- 关键：声明 DPI 感知。缺失时 Windows 会在 125%/150% 屏上把整个窗口位图拉伸，

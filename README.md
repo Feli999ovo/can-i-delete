@@ -3,13 +3,13 @@
   <h1>按平 · 看得懂依据的 Windows 空间分析与缓存清理工具</h1>
   <p>说人话的空间透视 · 文件头魔数与独占锁防误删底座 · 微信 / QQ 聊天存储细拆保护</p>
   <p>
-    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/版本-v1.0.0%20正式版-2ea44f" alt="v1.0.0 正式版" /></a>
+    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/版本-v1.0.1%20安全加固版-2ea44f" alt="v1.0.1 安全加固版" /></a>
     <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11%20x64-2ea44f?logo=windows" alt="Windows 10/11 x64" /></a>
-    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/体积-481%20KB%20纯净绿色免安装-2ea44f" alt="481 KB 纯净绿色免安装" /></a>
+    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/体积-~520%20KB%20纯净绿色免安装-2ea44f" alt="纯净绿色免安装" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/开源协议-MIT%20License-2ea44f" alt="MIT License" /></a>
   </p>
   <h3>
-    <a href="https://github.com/Feli999ovo/can-i-delete/releases/latest">⬇ 下载最新 Windows 绿色便携版 v1.0.0 (ZIP)</a>
+    <a href="https://github.com/Feli999ovo/can-i-delete/releases/latest">⬇ 下载最新 Windows 绿色便携版 v1.0.1 (ZIP)</a>
   </h3>
   <p><b>使用提醒：</b>下载后请先将 ZIP 完整解压到普通文件夹，再双击运行 <code>can-i-delete.exe</code>（切勿直接在压缩包预览窗口内双击）。</p>
 </div>
@@ -91,7 +91,7 @@
 - **便携解压结构**：请保持解压目录完整，不要单独拖出 `can-i-delete.exe` 运行：
 
 ```text
-按平-v1.0.0-win-x64-portable/
+anping-v1.0.1-win-x64-portable/
 ├─ can-i-delete.exe        # 主程序（内嵌多尺寸高清图标）
 ├─ WebView2Loader.dll      # WebView2 原生加载器
 ├─ LICENSE                 # MIT 开源许可证
@@ -111,7 +111,7 @@
 
 1. **先核对官方 SHA-256 校验值**：在下载目录打开 PowerShell，运行以下命令并核对输出哈希与 [Releases 发布页](https://github.com/Feli999ovo/can-i-delete/releases/latest) 中的 `SHA256SUMS.txt` 完全一致：
    ```powershell
-   Get-FileHash .\按平-v1.0.0-win-x64-portable.zip -Algorithm SHA256
+   Get-FileHash .\anping-v1.0.1-win-x64-portable.zip -Algorithm SHA256
    ```
 2. **确认校验一致后启动**：在蓝色提示窗点击 **「更多信息」** → 点击底部 **「仍要运行」**，后续在同一目录再次打开即不再弹窗。
 
