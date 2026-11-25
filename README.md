@@ -5,7 +5,8 @@
   <p>
     <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/版本-v1.0.1%20安全加固版-2ea44f" alt="v1.0.1 安全加固版" /></a>
     <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11%20x64-2ea44f?logo=windows" alt="Windows 10/11 x64" /></a>
-    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/体积-~520%20KB%20纯净绿色免安装-2ea44f" alt="纯净绿色免安装" /></a>
+    <a href="https://github.com/Feli999ovo/can-i-delete/releases"><img src="https://img.shields.io/badge/体积-498%20KB%20纯净绿色免安装-2ea44f" alt="498 KB 纯净绿色免安装" /></a>
+    <a href="docs/security-audit-report.md"><img src="https://img.shields.io/badge/安全审计-4层50项全量加固-2ea44f" alt="4层50项全量加固审计报告" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/开源协议-MIT%20License-2ea44f" alt="MIT License" /></a>
   </p>
   <h3>
@@ -53,14 +54,14 @@
 
 ### 2. 文件头魔数 + 独占锁核验的零误删底座
 按平绝不仅靠文件名或扩展名盲目删文件。点击「清理」批量永久删除受控缓存时，后端对每个文件执行双重硬核验：
-- **正向二进制内容校验**：逐个核对 Chromium Simple Cache / Blockfile 魔数、npm SHA-512 内容摘要、`CMMM` 缩略图头、`DXBC` 着色器头、`V1MMWX` 小程序包头或 `MDMP` 流边界；哪怕把重要 PDF 或 Word 文档改名放进临时文件夹，也会被文件头守卫直接拦截；
-- **同句柄身份与独占锁复核**：删除前以无共享模式打开目标句柄，在**同一个文件句柄**上核对磁盘卷序列号与文件索引（`VolumeSerial + FileIndex`）、逻辑大小及修改时间，防止扫描后文件被掉包（TOCTOU 防护）；正被运行中浏览器或软件占用的文件自动安全跳过。
+- **正向二进制内容校验与 Office OOXML 深度识别**：逐个核对 Chromium Simple Cache / Blockfile 魔数、npm SHA-512 内容摘要、`CMMM` 缩略图头、`DXBC` 着色器头、`V1MMWX` 小程序包头或 `MDMP` 流边界；针对 ZIP 容器执行有界 EOCD 与中央目录（Central Directory）扫描，哪怕把真实的 `.docx` / `.xlsx` / `.pptx` / `.vsdx` 改名放进缓存或临时文件夹，也会被直接拦截（同时保留合法 `.nupkg` / `.vsix` 缓存）；
+- **同句柄最终路径与独占锁复核**：删除前以无共享模式打开无重解析点句柄，在**同一个文件句柄**上核对 `GetFinalPathNameByHandleW` 规范长路径、磁盘卷序列号与文件索引（`VolumeSerial + FileIndex`）、逻辑大小及修改时间，封堵扫描后路径掉包与父目录 Junction 劫持（TOCTOU 防护）；正被运行中浏览器或软件占用的文件自动安全跳过。
 
 ### 3. 微信 / 企业微信 / QQ 跨盘细拆与聊天记录死锁保护
 针对国内办公最高频的聊天软件空间膨胀痛点，按平自动跨盘定位默认位置或迁移至 D 盘等分区的 `WeChat Files`、`xwechat_files`、`WXWork`、`Tencent Files` / NTQQ 存储目录，做三轨精细拆分：
 - **朋友圈与小程序纯缓存一键清（`TMP-CHATCACHE`）**：`Sns\Cache` 朋友圈图片视频缓存、`Applet` 小程序包与内置网页缓存经内容头校验后归入纯缓存清理；
-- **`Msg\*.db` 聊天记录库死锁保护（`KEEP-CHATDB`）**：微信 `Msg\*.db` 与 QQ `nt_db` 数据库在规则层、安全策略层与回收引擎实施三重硬拦截，强制标为 `○ 建议保留`，严禁批量清理与单文件回收；
-- **群聊接收大文件单独透视**：`FileStorage\File`、`Video`、`MsgAttach` 与 `FileRecv` 接收原件绝不自动删除，可在「大文件 → 聊天接收文件」胶囊下按体积排序查看，确认无用可手动移入 Windows 系统回收站（需要时随时从桌面回收站还原）。
+- **`Msg\*.db` / `db_storage` 聊天记录库死锁保护（`KEEP-CHATDB`）**：微信 3.x `Msg\*.db`、微信 4.x `db_storage` 与 QQ `Msg3.0.db` / `nt_db` / `nt_data` 数据库（含 `-wal`/`-shm`/`-journal`）在规则层、安全策略层与回收引擎实施三重硬拦截，强制标为 `○ 建议保留`，严禁批量清理与单文件回收；
+- **群聊接收大文件单独透视**：`FileStorage\File`、`Video`、`MsgAttach` 与 `FileRecv` 接收原件绝不自动删除，可在「大文件 → 聊天接收文件」胶囊下按体积排序查看，确认无用可手动移入 Windows 系统回收站（强制校验 `TSF_DELETE_RECYCLE_IF_POSSIBLE` 闸门，回收站不可用或被策略禁用时绝不静默降级为永久删除）。
 
 ---
 
@@ -81,7 +82,11 @@
 | `TMP-WINUPDATE` | Windows 更新下载缓存 · SoftwareDistribution | `%WINDIR%\SoftwareDistribution\Download\`（**严禁触碰 `DataStore` 更新历史数据库**） | 修改时间须满 **48 小时**，且通过 `MSCF`（CAB）、`MSWIM`（ESD）或更新清单结构校验 | 移除超过 48 小时的旧系统补丁下载副本，不影响已安装的更新；近期补丁自动跳过 |
 | `TMP-CRASHDUMP` | 系统转储与诊断日志 · 崩溃转储 | `%LOCALAPPDATA%\CrashDumps\` | 校验 `MDMP` 文件头、流目录及每个数据流边界；内核转储（`PAGEDU64`）不删；**默认不勾选，须单独勾选确认** | **无法重新生成**：删除后无法再把这次崩溃转储发给软件厂商排查问题；不影响程序运行 |
 
-> **审计边界承诺**：批量「清理」为**永久删除**，不经过系统回收站；每次批量清理或单文件移入回收站前后均强制写入本地审计日志 `data\delete-log.txt`（`Intent -> Action -> Outcome`），日志不可写时整批拒绝执行。
+> **安全审计与边界承诺**（完整四层 50 项全量加固与双轮复审记录见 [`docs/security-audit-report.md`](docs/security-audit-report.md)）：
+> - **先写意图再执行**：批量「清理」为**永久删除**（不经过系统回收站）；每次批量清理或单文件移入回收站前后均强制经无重解析点单链接句柄写入本地审计日志 `data\delete-log.txt`（`Intent -> Action -> Outcome`），日志不可写或遭符号链接篡改时整批拒绝执行。
+> - **提权与供应链隔离**：启动与初始化 WebView2 前清除所有敏感 `WEBVIEW2_*` 继承环境变量防止跨权限参数/调试器注入；全局声明 `[assembly: DefaultDllImportSearchPaths(DllImportSearchPath.System32)]` 与 `SetDllDirectory("")` 防 DLL 搜索顺序劫持，管理员模式下对 WebView2 组件强制核验微软 Authenticode 签名（`CN=Microsoft Corporation`）。
+> - **前端严格沙盒与零外联**：移除所有 `eval` 与内联脚本/样式，启用严格 CSP（零 `'unsafe-inline'`、零 `'unsafe-eval'`）与 `Deny` 虚拟主机跨域策略，WebView2 宿主层拦截全部外部导航、弹窗、下载、权限申请与浏览器快捷键越权。
+> - **Fail-Closed 主动跳过说明**：为杜绝路径混淆与跨边界误删，程序会主动安全跳过或拒绝处理 **`SUBST` 虚拟映射盘、重解析点/符号链接链路、NTFS 备用数据流（`:ads`）以及超过 260 字符的路径**；单文件回收站强制核验 `TSF_DELETE_RECYCLE_IF_POSSIBLE` 与 `NoRecycleFiles` 系统策略，遇异常即安全中止，绝不静默降级为永久删除。
 
 ---
 
@@ -127,13 +132,14 @@ can-i-delete/
 └─ ui/        白瓷浮雕前端界面（index.html + styles.css + app.js）与合成提示音模块（anping-audio.js）
 ```
 
-## 从源码构建及 259+ 项自动化安全回归测试
+## 从源码构建及 310+ 项自动化安全回归测试
 
-- **零外部构建器编译**：在源码根目录运行 `cmd /c build.bat`，直接调用 Windows 内置 `.NET Framework 4.x csc.exe`（严格遵循 C# 5 `-langversion:5 -warnaserror` 零警告标准），编译产出内嵌多尺寸原生图标的 `can-i-delete.exe`（同时兼容 `can-i-delete.csproj`）。
-- **259+ 项隔离沙盒回归测试**：
-  1. 运行 `cmd /c tests\run-tests.bat`：依次执行 `LegacyRepro`（17 项历史防误删回归）、`SelfTest`（Group A–E 共 240+ 项覆盖十大规则正反例、重解析点拦截、TOCTOU 句柄防掉包、微信数据库硬保护、单实例互斥与日志轮转）以及 `AnPingExplanationTest` 人话解释测试；
-  2. 运行 `tests\*.cjs` 全部 10 个前端状态机、几何规范、提示音波形与便携数据目录契约测试。
+- **零外部构建器编译与供应链校验**：在源码根目录运行 `cmd /c build.bat`，脚本先对随附的 3 个微软 WebView2 DLL 执行 **SHA-256 完整性校验**，再直接调用 Windows 内置 `.NET Framework 4.x csc.exe`（严格遵循 C# 5 `-langversion:5 -warnaserror -platform:x64 -highentropyva+ -optimize+` 零警告、x64 高熵 ASLR / DEP 加固标准），编译产出内嵌多尺寸原生图标的 `can-i-delete.exe`（同时兼容 `can-i-delete.csproj`）。
+- **310+ 项隔离沙盒安全与功能回归测试**：
+  1. 运行 `cmd /c tests\run-tests.bat`：依次执行 `LegacyRepro`（17 项历史防误删回归）、`SelfTest`（**Group A–F 共 291 项**，覆盖十大规则正反例、重解析点拦截、TOCTOU 句柄防掉包、微信数据库硬保护、单实例互斥、日志轮转以及新增 **Group F 32 项全栈安全回归套件**）以及 `AnPingExplanationTest` 人话解释测试；
+  2. 运行 `tests\anping-*.cjs` 全部 10 个前端状态机、CSP/XSS 逃逸防护、几何规范、提示音波形与原生 WebView2 便携数据目录（`.NET DirectorySecurity`）契约测试。
   所有自动化测试全程在 `%TEMP%` 或临时隔离沙盒内运行，对本机真实用户文件与系统设置零副作用。
+- **全栈安全审计报告**：四层架构（Host / Engine / Rules / UI）50 项分层（47 项去重）安全审计与修复验证矩阵见 [`docs/security-audit-report.md`](docs/security-audit-report.md)。
 
 ---
 
